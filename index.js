@@ -1,4 +1,4 @@
-// @jfs/pwa-kit v0.2.0 — shared service-worker primitives for the JFS family of
+// @jfs/pwa-kit — shared service-worker primitives for the JFS family of
 // buildless static PWAs.
 //
 // Every sibling app (Weather, FlightCheck, Art-Gallery, market-monitor,
