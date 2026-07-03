@@ -284,6 +284,240 @@ test('networkFirstWithTimeout: pre-timeout 5xx prefers cached good copy', async 
   assert.equal(r.body, 'good');
 });
 
+// ──────────────────── strategy edge cases (regression pins) ────────────────────
+//
+// These pin the strategies' subtle behaviors exactly as implemented — timeout
+// races, 5xx-prefers-cache, background revalidation — so refactors can't drift.
+
+const microtasks = async (n = 4) => { for (let i = 0; i < n; i++) await Promise.resolve(); };
+const macrotask = () => new Promise((res) => setImmediate(res));
+
+/** A scope whose fetch is manually resolvable/rejectable and whose timers are
+ *  captured and fired on demand, so tests control the exact race ordering. */
+function deferredScope() {
+  let resolveNet, rejectNet;
+  const scope = makeScope({
+    fetchImpl: () => new Promise((res, rej) => { resolveNet = res; rejectNet = rej; }),
+  });
+  const timers = [];
+  scope.setTimeout = (fn) => { timers.push(fn); return 0; };
+  scope._resolveNet = (r) => resolveNet(r);
+  scope._rejectNet = (e) => rejectNet(e);
+  scope._fireTimers = async () => { for (const fn of timers.splice(0)) await fn(); };
+  return scope;
+}
+
+test('networkFirstWithTimeout: network settling just before the timeout wins over warm cache', async () => {
+  const scope = deferredScope();
+  const ctx = ctxFor(scope, 'api', { timeoutMs: 50 });
+  const cache = await scope.caches.open('api');
+  await cache.put('https://app.test/q', makeResponse('cached'));
+  const pending = networkFirstWithTimeout({ url: 'https://app.test/q' }, ctx);
+  await microtasks(); // let the strategy open the cache and start the fetch
+  scope._resolveNet(makeResponse('net')); // network settles before the timer fires
+  const r = await pending;
+  assert.equal(r.body, 'net'); // fresh response wins — the cache is not consulted
+  await scope._fireTimers(); // late timer sees settled=true and no-ops
+  assert.equal((await cache.match('https://app.test/q')).body, 'net'); // cache refreshed
+});
+
+test('networkFirstWithTimeout: timeout serves warm cache; late network still refreshes the cache', async () => {
+  const scope = deferredScope();
+  const ctx = ctxFor(scope, 'api', { timeoutMs: 5 });
+  const cache = await scope.caches.open('api');
+  await cache.put('https://app.test/q', makeResponse('cached'));
+  const pending = networkFirstWithTimeout({ url: 'https://app.test/q' }, ctx);
+  await microtasks();
+  await scope._fireTimers(); // timeout fires while the network is still pending
+  assert.equal((await pending).body, 'cached');
+  scope._resolveNet(makeResponse('late'));
+  await microtasks();
+  assert.equal((await cache.match('https://app.test/q')).body, 'late'); // next tick gets fresh
+});
+
+test('networkFirstWithTimeout: timeout on a cold cache keeps waiting for the network', async () => {
+  const scope = deferredScope();
+  const ctx = ctxFor(scope, 'api', { timeoutMs: 5 });
+  const pending = networkFirstWithTimeout({ url: 'https://app.test/q' }, ctx);
+  await microtasks();
+  await scope._fireTimers(); // no cached copy → the timeout branch has nothing to serve
+  let resolved = false;
+  pending.then(() => { resolved = true; });
+  await microtasks();
+  assert.equal(resolved, false); // still pending: the strategy waits out the network
+  scope._resolveNet(makeResponse('eventually'));
+  assert.equal((await pending).body, 'eventually');
+});
+
+test('networkFirstWithTimeout: network error after timeout served cache — no unhandled rejection', async () => {
+  const scope = deferredScope();
+  const ctx = ctxFor(scope, 'api', { timeoutMs: 5 });
+  const cache = await scope.caches.open('api');
+  await cache.put('https://app.test/q', makeResponse('cached'));
+  const pending = networkFirstWithTimeout({ url: 'https://app.test/q' }, ctx);
+  await microtasks();
+  await scope._fireTimers();
+  assert.equal((await pending).body, 'cached');
+  let unhandled = null;
+  const onUR = (e) => { unhandled = e; };
+  process.on('unhandledRejection', onUR);
+  try {
+    scope._rejectNet(new Error('net down')); // the dangling fetch fails after the fact
+    await macrotask(); await macrotask();
+    assert.equal(unhandled, null); // rejection is absorbed by the race
+    assert.equal((await cache.match('https://app.test/q')).body, 'cached'); // not clobbered
+  } finally {
+    process.off('unhandledRejection', onUR);
+  }
+});
+
+test('networkFirstWithTimeout: pre-timeout rejection → cache, then fallback, then rethrow', async () => {
+  const offline = () => makeScope({ fetchImpl: async () => { throw new Error('offline'); } });
+  const warm = offline();
+  await (await warm.caches.open('api')).put('https://app.test/q', makeResponse('cached'));
+  const r1 = await networkFirstWithTimeout({ url: 'https://app.test/q' }, ctxFor(warm, 'api', { timeoutMs: 50 }));
+  assert.equal(r1.body, 'cached');
+  const cold = offline();
+  const r2 = await networkFirstWithTimeout({ url: 'https://app.test/q' },
+    ctxFor(cold, 'api', { timeoutMs: 50, fallback: () => offlineResponse('off') }));
+  assert.equal(r2.status, 503); // fallback used on cold cache
+  const bare = offline();
+  await assert.rejects(
+    () => networkFirstWithTimeout({ url: 'https://app.test/q' }, ctxFor(bare, 'api', { timeoutMs: 50 })),
+    /offline/); // no cache, no fallback → the network error propagates
+});
+
+test('networkFirstWithTimeout: 500 and 502 with warm cache serve the cached copy, never clobber it', async () => {
+  for (const status of [500, 502]) {
+    const scope = makeScope({ fetchImpl: async () => makeResponse('err', { ok: false, status }) });
+    const cache = await scope.caches.open('api');
+    await cache.put('https://app.test/q', makeResponse('good'));
+    const r = await networkFirstWithTimeout({ url: 'https://app.test/q' }, ctxFor(scope, 'api', { timeoutMs: 50 }));
+    assert.equal(r.body, 'good', `status ${status} should prefer the cached copy`);
+    assert.equal((await cache.match('https://app.test/q')).body, 'good'); // 5xx never cached (default isCacheable)
+  }
+});
+
+test('networkFirstWithTimeout: 5xx with a cold cache returns the 5xx itself', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('err', { ok: false, status: 502 }) });
+  const r = await networkFirstWithTimeout({ url: 'https://app.test/q' }, ctxFor(scope, 'api', { timeoutMs: 50 }));
+  assert.equal(r.status, 502); // nothing better to serve — surfaced as-is
+});
+
+test('networkFirstWithTimeout: 404 is not a server error — passes through despite warm cache', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('nf', { ok: false, status: 404 }) });
+  const cache = await scope.caches.open('api');
+  await cache.put('https://app.test/q', makeResponse('good'));
+  const r = await networkFirstWithTimeout({ url: 'https://app.test/q' }, ctxFor(scope, 'api', { timeoutMs: 50 }));
+  assert.equal(r.status, 404); // only >= 500 prefers cache; client errors surface
+  assert.equal((await cache.match('https://app.test/q')).body, 'good'); // and don't clobber
+});
+
+test('staleWhileRevalidate: cold cache waits for the network and caches the result', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  const r = await staleWhileRevalidate({ url: 'https://app.test/d.json' }, ctxFor(scope, 'c'));
+  assert.equal(r.body, 'net');
+  await microtasks();
+  const cache = await scope.caches.open('c');
+  assert.equal((await cache.match('https://app.test/d.json')).body, 'net');
+});
+
+test('staleWhileRevalidate: background revalidation failure neither rejects nor clobbers cache', async () => {
+  const scope = makeScope({ fetchImpl: async () => { throw new Error('offline'); } });
+  const cache = await scope.caches.open('c');
+  await cache.put('https://app.test/d.json', makeResponse('v1'));
+  let unhandled = null;
+  const onUR = (e) => { unhandled = e; };
+  process.on('unhandledRejection', onUR);
+  try {
+    const r = await staleWhileRevalidate({ url: 'https://app.test/d.json' }, ctxFor(scope, 'c'));
+    assert.equal(r.body, 'v1'); // stale copy served despite the failing refresh
+    await macrotask(); await macrotask();
+    assert.equal(unhandled, null); // the background rejection is swallowed
+    assert.equal((await cache.match('https://app.test/d.json')).body, 'v1'); // cache intact
+  } finally {
+    process.off('unhandledRejection', onUR);
+  }
+});
+
+test('staleWhileRevalidate: a 5xx revalidation is not cached — the stale copy survives', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('boom', { ok: false, status: 500 }) });
+  const cache = await scope.caches.open('c');
+  await cache.put('https://app.test/d.json', makeResponse('v1'));
+  const r = await staleWhileRevalidate({ url: 'https://app.test/d.json' }, ctxFor(scope, 'c'));
+  assert.equal(r.body, 'v1');
+  await microtasks();
+  assert.equal((await cache.match('https://app.test/d.json')).body, 'v1'); // 500 didn't clobber
+});
+
+test('staleWhileRevalidate: cold cache + rejection uses fallback when given, else rejects', async () => {
+  const withFb = makeScope({ fetchImpl: async () => { throw new Error('offline'); } });
+  const r = await staleWhileRevalidate({ url: 'https://app.test/d.json' },
+    ctxFor(withFb, 'c', { fallback: () => offlineResponse('off') }));
+  assert.equal(r.status, 503);
+  const noFb = makeScope({ fetchImpl: async () => { throw new Error('offline'); } });
+  await assert.rejects(() => staleWhileRevalidate({ url: 'https://app.test/d.json' }, ctxFor(noFb, 'c')), /offline/);
+});
+
+test('staleWhileRevalidate: cold cache + 5xx resolves with the 5xx — fallback is rejection-only', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('boom', { ok: false, status: 500 }) });
+  const r = await staleWhileRevalidate({ url: 'https://app.test/d.json' },
+    ctxFor(scope, 'c', { fallback: () => offlineResponse('off') }));
+  assert.equal(r.status, 500); // resolved (not rejected) → fallback not consulted
+});
+
+test('cacheFirst: non-cacheable response is returned but never cached', async () => {
+  let calls = 0;
+  const scope = makeScope({ fetchImpl: async () => { calls++; return makeResponse('boom', { ok: false, status: 500 }); } });
+  const ctx = ctxFor(scope, 'c');
+  const r1 = await cacheFirst({ url: 'https://app.test/a.js' }, ctx);
+  assert.equal(r1.status, 500); // the 5xx is surfaced, not swallowed
+  const r2 = await cacheFirst({ url: 'https://app.test/a.js' }, ctx);
+  assert.equal(r2.status, 500);
+  assert.equal(calls, 2); // the 500 never entered the cache, so both calls hit the network
+});
+
+test('cacheFirst: cold-cache network rejection propagates — no fallback path exists', async () => {
+  const scope = makeScope({ fetchImpl: async () => { throw new Error('offline'); } });
+  const ctx = ctxFor(scope, 'c', { fallback: () => offlineResponse('off') }); // deliberately ignored
+  await assert.rejects(() => cacheFirst({ url: 'https://app.test/a.js' }, ctx), /offline/);
+});
+
+test('cacheFirst: ctx.cacheKey aliases the lookup — a hit short-circuits fetch entirely', async () => {
+  let calls = 0;
+  const scope = makeScope({ fetchImpl: async () => { calls++; return makeResponse('net'); } });
+  const cache = await scope.caches.open('c');
+  await cache.put('https://app.test/a.js', makeResponse('cached'));
+  const ctx = ctxFor(scope, 'c', { cacheKey: 'https://app.test/a.js' });
+  const r = await cacheFirst({ url: 'https://app.test/a.js?cb=123' }, ctx); // busted URL, stripped key
+  assert.equal(r.body, 'cached');
+  assert.equal(calls, 0); // fetch never called on a cache hit
+});
+
+test('networkFirst: a 5xx passes through as-is and never pollutes the cache', async () => {
+  let mode = 'fresh';
+  const scope = makeScope({
+    fetchImpl: async () => {
+      if (mode === 'err') return makeResponse('boom', { ok: false, status: 500 });
+      if (mode === 'offline') throw new Error('offline');
+      return makeResponse('fresh');
+    },
+  });
+  const ctx = ctxFor(scope, 'c');
+  await networkFirst({ url: 'https://app.test/i.html' }, ctx); // primes the cache with a 200
+  mode = 'err';
+  const r = await networkFirst({ url: 'https://app.test/i.html' }, ctx);
+  assert.equal(r.status, 500); // HTTP errors are NOT rescued by cache here — only rejections are
+  mode = 'offline';
+  const r2 = await networkFirst({ url: 'https://app.test/i.html' }, ctx);
+  assert.equal(r2.body, 'fresh'); // the 500 never overwrote the good cached copy
+});
+
+test('networkFirst: cold cache + rejection + no fallback rethrows the network error', async () => {
+  const scope = makeScope({ fetchImpl: async () => { throw new Error('offline'); } });
+  await assert.rejects(() => networkFirst({ url: 'https://app.test/x.html' }, ctxFor(scope, 'c')), /offline/);
+});
+
 // ───────────────────────── factory smoke (v0.1.0 behavior) ─────────────────────────
 
 test('createServiceWorker still wires install/activate/fetch', async () => {
