@@ -29,6 +29,28 @@ market-monitor, JFS-Sports compose these in a slim `sw.js`):
 simple "one shell, one strategy" case (Weather, FlightCheck), built on the
 primitives above.
 
+**3. `registerServiceWorker(options)`** — the **page-side** counterpart (runs
+in the page, not the worker). Every sibling app hand-rolls the same shape:
+register `sw.js`, watch `installing`, and when a worker reaches `installed`
+while one is *already controlling the page* (a real upgrade, not the first
+install), tell the app so it can prompt a refresh. None auto-reload. Only the
+notify step differs per app — that's the injected `onUpdate` callback:
+
+```js
+// sw-register.js (ESM page module)
+import { registerServiceWorker } from './pwa-kit/index.js';
+
+registerServiceWorker({
+  onUpdate: () => window.dispatchEvent(new CustomEvent('sw-update-ready')),
+});
+```
+
+Options: `scope` (window-like, default `globalThis` — injected so it's
+unit-testable without global mocks), `swUrl` (default `'sw.js'`),
+`registerOptions` (e.g. `{ updateViaCache: 'none' }`), `waitForLoad` (defer to
+the page `load` event), `onUpdate(worker, registration)`, `onError(err)`.
+Classic-script pages read it off the global build as `PWAKit.registerServiceWorker`.
+
 ## How it's consumed
 
 These are buildless sites, and a **classic** service worker can't `import` an
