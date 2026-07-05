@@ -547,7 +547,7 @@ function makeWorker(state = 'installing') {
 
 // A window-like scope. `controller` mimics navigator.serviceWorker.controller
 // (null on first-ever install, non-null once a worker controls the page).
-function makePageScope({ controller = null, installing = makeworkerOrNull(), supported = true } = {}) {
+function makePageScope({ controller = null, installing = makeworkerOrNull(), supported = true, readyState = 'loading' } = {}) {
   const regListeners = {};
   const registration = {
     installing,
@@ -559,6 +559,7 @@ function makePageScope({ controller = null, installing = makeworkerOrNull(), sup
   const calls = { register: [] };
   const scope = {
     registration,
+    document: { readyState },
     addEventListener(type, cb) { (winListeners[type] ||= []).push(cb); },
     _fireLoad() { (winListeners.load || []).forEach((cb) => cb()); },
     navigator: supported ? {
@@ -616,11 +617,20 @@ test('registerServiceWorker: watches a worker that arrives via updatefound', asy
 });
 
 test('registerServiceWorker: waitForLoad defers registration until load', async () => {
-  const scope = makePageScope({ controller: {}, installing: makeWorker() });
+  const scope = makePageScope({ controller: {}, installing: makeWorker() }); // readyState 'loading'
   registerServiceWorker({ scope, waitForLoad: true });
   await flush();
   assert.equal(scope.calls.register.length, 0); // nothing registered yet
   scope._fireLoad();
+  await flush();
+  assert.equal(scope.calls.register.length, 1);
+});
+
+test('registerServiceWorker: waitForLoad registers immediately if page already loaded', async () => {
+  // If load already fired (module imported late), don't wait for an event that
+  // will never come again.
+  const scope = makePageScope({ controller: {}, installing: makeWorker(), readyState: 'complete' });
+  registerServiceWorker({ scope, waitForLoad: true });
   await flush();
   assert.equal(scope.calls.register.length, 1);
 });
