@@ -22,6 +22,7 @@ import {
   staleWhileRevalidate,
   networkFirstWithTimeout,
   createServiceWorker,
+  registerServiceWorker,
 } from './index.js';
 
 // ───────────────────────── shared fakes ─────────────────────────
@@ -530,4 +531,111 @@ test('createServiceWorker still wires install/activate/fetch', async () => {
   await scope.caches.open('w-OLD');
   await scope._dispatch('activate', {});
   assert.ok(!(await scope.caches.keys()).includes('w-OLD'));
+});
+
+// ───────────────── registerServiceWorker (page side) ─────────────────
+
+function makeWorker(state = 'installing') {
+  const listeners = {};
+  return {
+    state,
+    addEventListener(type, cb) { (listeners[type] ||= []).push(cb); },
+    _emit(type) { (listeners[type] || []).forEach((cb) => cb()); },
+    setState(s) { this.state = s; this._emit('statechange'); },
+  };
+}
+
+// A window-like scope. `controller` mimics navigator.serviceWorker.controller
+// (null on first-ever install, non-null once a worker controls the page).
+function makePageScope({ controller = null, installing = makeworkerOrNull(), supported = true } = {}) {
+  const regListeners = {};
+  const registration = {
+    installing,
+    addEventListener(type, cb) { (regListeners[type] ||= []).push(cb); },
+    _emit(type, arg) { (regListeners[type] || []).forEach((cb) => cb(arg)); },
+    setInstalling(w) { this.installing = w; },
+  };
+  const winListeners = {};
+  const calls = { register: [] };
+  const scope = {
+    registration,
+    addEventListener(type, cb) { (winListeners[type] ||= []).push(cb); },
+    _fireLoad() { (winListeners.load || []).forEach((cb) => cb()); },
+    navigator: supported ? {
+      serviceWorker: {
+        controller,
+        register(url, opts) { calls.register.push([url, opts]); return Promise.resolve(registration); },
+      },
+    } : {},
+    calls,
+  };
+  return scope;
+}
+function makeworkerOrNull() { return makeWorker(); }
+
+const flush = () => Promise.resolve().then(() => Promise.resolve());
+
+test('registerServiceWorker: fires onUpdate on a real upgrade (controller present)', async () => {
+  const worker = makeWorker();
+  const scope = makePageScope({ controller: {}, installing: worker });
+  let updated = 0;
+  registerServiceWorker({ scope, onUpdate: () => { updated += 1; } });
+  await flush();
+  worker.setState('installed');
+  assert.equal(updated, 1);
+  assert.deepEqual(scope.calls.register[0], ['sw.js', undefined]); // default url, no opts
+});
+
+test('registerServiceWorker: does NOT fire on first install (no controller)', async () => {
+  const worker = makeWorker();
+  const scope = makePageScope({ controller: null, installing: worker });
+  let updated = 0;
+  registerServiceWorker({ scope, onUpdate: () => { updated += 1; } });
+  await flush();
+  worker.setState('installed');
+  assert.equal(updated, 0);
+});
+
+test('registerServiceWorker: passes swUrl + registerOptions through', async () => {
+  const scope = makePageScope({ controller: {}, installing: makeWorker() });
+  registerServiceWorker({ scope, swUrl: './sw.js', registerOptions: { updateViaCache: 'none' } });
+  await flush();
+  assert.deepEqual(scope.calls.register[0], ['./sw.js', { updateViaCache: 'none' }]);
+});
+
+test('registerServiceWorker: watches a worker that arrives via updatefound', async () => {
+  const scope = makePageScope({ controller: {}, installing: null });
+  let updated = 0;
+  registerServiceWorker({ scope, onUpdate: () => { updated += 1; } });
+  await flush();
+  const later = makeWorker();
+  scope.registration.setInstalling(later);
+  scope.registration._emit('updatefound');
+  later.setState('installed');
+  assert.equal(updated, 1);
+});
+
+test('registerServiceWorker: waitForLoad defers registration until load', async () => {
+  const scope = makePageScope({ controller: {}, installing: makeWorker() });
+  registerServiceWorker({ scope, waitForLoad: true });
+  await flush();
+  assert.equal(scope.calls.register.length, 0); // nothing registered yet
+  scope._fireLoad();
+  await flush();
+  assert.equal(scope.calls.register.length, 1);
+});
+
+test('registerServiceWorker: no-op without serviceWorker support', () => {
+  const scope = makePageScope({ supported: false });
+  assert.doesNotThrow(() => registerServiceWorker({ scope, onUpdate() {} }));
+  assert.equal(scope.calls.register.length, 0);
+});
+
+test('registerServiceWorker: onError called when register() rejects', async () => {
+  const scope = makePageScope({ controller: {} });
+  scope.navigator.serviceWorker.register = () => Promise.reject(new Error('nope'));
+  let err = null;
+  registerServiceWorker({ scope, onError: (e) => { err = e; } });
+  await flush();
+  assert.equal(err?.message, 'nope');
 });
