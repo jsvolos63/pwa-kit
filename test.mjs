@@ -547,10 +547,11 @@ function makeWorker(state = 'installing') {
 
 // A window-like scope. `controller` mimics navigator.serviceWorker.controller
 // (null on first-ever install, non-null once a worker controls the page).
-function makePageScope({ controller = null, installing = makeworkerOrNull(), supported = true, readyState = 'loading' } = {}) {
+function makePageScope({ controller = null, installing = makeworkerOrNull(), supported = true, readyState = 'loading', waiting = null } = {}) {
   const regListeners = {};
   const registration = {
     installing,
+    waiting,
     addEventListener(type, cb) { (regListeners[type] ||= []).push(cb); },
     _emit(type, arg) { (regListeners[type] || []).forEach((cb) => cb(arg)); },
     setInstalling(w) { this.installing = w; },
@@ -633,6 +634,37 @@ test('registerServiceWorker: waitForLoad registers immediately if page already l
   registerServiceWorker({ scope, waitForLoad: true });
   await flush();
   assert.equal(scope.calls.register.length, 1);
+});
+
+test('registerServiceWorker: fires onUpdate for a worker already waiting from a prior visit', async () => {
+  // reg.waiting is set at register time, no installing worker, updatefound never
+  // fires — the fix must announce it directly.
+  const scope = makePageScope({ controller: {}, installing: null, waiting: makeWorker('installed') });
+  let updated = 0;
+  let seen = null;
+  registerServiceWorker({ scope, onUpdate: (w) => { updated += 1; seen = w; } });
+  await flush();
+  assert.equal(updated, 1);
+  assert.equal(seen, scope.registration.waiting);
+});
+
+test('registerServiceWorker: does NOT announce a waiting worker on first install (no controller)', async () => {
+  const scope = makePageScope({ controller: null, installing: null, waiting: makeWorker('installed') });
+  let updated = 0;
+  registerServiceWorker({ scope, onUpdate: () => { updated += 1; } });
+  await flush();
+  assert.equal(updated, 0);
+});
+
+test('registerServiceWorker: tolerates register() resolving with no registration', async () => {
+  const scope = makePageScope({ controller: {} });
+  scope.navigator.serviceWorker.register = () => Promise.resolve(undefined);
+  let updated = 0;
+  let errored = false;
+  registerServiceWorker({ scope, onUpdate: () => { updated += 1; }, onError: () => { errored = true; } });
+  await flush();
+  assert.equal(updated, 0);
+  assert.equal(errored, false); // a missing registration is not an error
 });
 
 test('registerServiceWorker: no-op without serviceWorker support', () => {
