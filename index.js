@@ -447,6 +447,15 @@ export function createServiceWorker(config) {
  *   registration.
  * @param {(err: any) => void} [options.onError] called if register() rejects
  *   (file:// / unsupported / dev server). Silent by default.
+ * @param {boolean} [options.updateOnVisible=false] call registration.update()
+ *   whenever the page returns to the foreground (visibilitychange → visible).
+ *   iOS home-screen PWAs are suspended, not relaunched, when the user switches
+ *   back — no navigation happens, so the browser never re-checks sw.js and an
+ *   update can go unnoticed for days. update() is a no-op when the live worker
+ *   is byte-identical, so foreground checks are cheap.
+ * @param {number} [options.updateIntervalMs=0] additionally call
+ *   registration.update() on this interval (0 = off) so long-lived visible
+ *   sessions also notice a deploy.
  * @returns {void}
  */
 export function registerServiceWorker(options = {}) {
@@ -457,6 +466,8 @@ export function registerServiceWorker(options = {}) {
     waitForLoad = false,
     onUpdate,
     onError,
+    updateOnVisible = false,
+    updateIntervalMs = 0,
   } = options;
 
   const nav = scope && scope.navigator;
@@ -492,6 +503,24 @@ export function registerServiceWorker(options = {}) {
       // `installing` nor `updatefound` covers that — announce it directly so an
       // update that's been ready since last time isn't silently stranded.
       if (reg.waiting && nav.serviceWorker.controller) announce(reg.waiting);
+      // Proactive update checks. Browsers only re-check sw.js on navigation,
+      // which a resumed iOS home-screen PWA never performs — so without these
+      // the onUpdate prompt can lag a deploy by days.
+      const checkForUpdate = () => {
+        try {
+          const up = reg.update();
+          if (up && typeof up.catch === 'function') up.catch(() => {});
+        } catch (_) { /* update() unsupported — best-effort only */ }
+      };
+      const doc = scope && scope.document;
+      if (updateOnVisible && doc && typeof doc.addEventListener === 'function') {
+        doc.addEventListener('visibilitychange', () => {
+          if (doc.visibilityState === 'visible') checkForUpdate();
+        });
+      }
+      if (updateIntervalMs > 0 && scope && typeof scope.setInterval === 'function') {
+        scope.setInterval(checkForUpdate, updateIntervalMs);
+      }
     }).catch((err) => {
       if (typeof onError === 'function') onError(err);
     });

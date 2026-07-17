@@ -48,7 +48,12 @@ registerServiceWorker({
 Options: `scope` (window-like, default `globalThis` — injected so it's
 unit-testable without global mocks), `swUrl` (default `'sw.js'`),
 `registerOptions` (e.g. `{ updateViaCache: 'none' }`), `waitForLoad` (defer to
-the page `load` event), `onUpdate(worker, registration)`, `onError(err)`.
+the page `load` event), `onUpdate(worker, registration)`, `onError(err)`,
+`updateOnVisible` (call `registration.update()` whenever the page returns to
+the foreground — iOS home-screen PWAs are *resumed*, not relaunched, so no
+navigation ever re-checks `sw.js` and an update can go unnoticed for days),
+`updateIntervalMs` (additionally re-check on a slow interval for long-lived
+visible sessions; 0 = off).
 Classic-script pages read it off the global build as `PWAKit.registerServiceWorker`.
 
 ## How it's consumed
