@@ -549,18 +549,29 @@ function makeWorker(state = 'installing') {
 // (null on first-ever install, non-null once a worker controls the page).
 function makePageScope({ controller = null, installing = makeworkerOrNull(), supported = true, readyState = 'loading', waiting = null } = {}) {
   const regListeners = {};
+  const calls = { register: [], update: 0, intervals: [] };
   const registration = {
     installing,
     waiting,
     addEventListener(type, cb) { (regListeners[type] ||= []).push(cb); },
     _emit(type, arg) { (regListeners[type] || []).forEach((cb) => cb(arg)); },
     setInstalling(w) { this.installing = w; },
+    update() { calls.update += 1; return Promise.resolve(); },
   };
   const winListeners = {};
-  const calls = { register: [] };
+  const docListeners = {};
   const scope = {
     registration,
-    document: { readyState },
+    document: {
+      readyState,
+      visibilityState: 'visible',
+      addEventListener(type, cb) { (docListeners[type] ||= []).push(cb); },
+    },
+    _setVisibility(state) {
+      scope.document.visibilityState = state;
+      (docListeners.visibilitychange || []).forEach((cb) => cb());
+    },
+    setInterval(fn, ms) { calls.intervals.push([fn, ms]); return 0; },
     addEventListener(type, cb) { (winListeners[type] ||= []).push(cb); },
     _fireLoad() { (winListeners.load || []).forEach((cb) => cb()); },
     navigator: supported ? {
@@ -680,4 +691,52 @@ test('registerServiceWorker: onError called when register() rejects', async () =
   registerServiceWorker({ scope, onError: (e) => { err = e; } });
   await flush();
   assert.equal(err?.message, 'nope');
+});
+
+test('registerServiceWorker: updateOnVisible re-checks when the page returns to foreground', async () => {
+  const scope = makePageScope({ controller: {} });
+  registerServiceWorker({ scope, updateOnVisible: true });
+  await flush();
+  assert.equal(scope.calls.update, 0); // no check until a visibility flip
+  scope._setVisibility('hidden');
+  assert.equal(scope.calls.update, 0); // going hidden never checks
+  scope._setVisibility('visible');
+  assert.equal(scope.calls.update, 1); // foreground → one update() check
+  scope._setVisibility('hidden');
+  scope._setVisibility('visible');
+  assert.equal(scope.calls.update, 2);
+});
+
+test('registerServiceWorker: no visibility listener or interval by default', async () => {
+  const scope = makePageScope({ controller: {} });
+  registerServiceWorker({ scope });
+  await flush();
+  scope._setVisibility('hidden');
+  scope._setVisibility('visible');
+  assert.equal(scope.calls.update, 0);
+  assert.equal(scope.calls.intervals.length, 0);
+});
+
+test('registerServiceWorker: updateIntervalMs wires a periodic update() check', async () => {
+  const scope = makePageScope({ controller: {} });
+  registerServiceWorker({ scope, updateIntervalMs: 15 * 60 * 1000 });
+  await flush();
+  assert.equal(scope.calls.intervals.length, 1);
+  const [tick, ms] = scope.calls.intervals[0];
+  assert.equal(ms, 15 * 60 * 1000);
+  tick();
+  tick();
+  assert.equal(scope.calls.update, 2);
+});
+
+test('registerServiceWorker: update() rejections from proactive checks are swallowed', async () => {
+  const scope = makePageScope({ controller: {} });
+  scope.registration.update = () => Promise.reject(new Error('offline'));
+  let errored = false;
+  registerServiceWorker({ scope, updateOnVisible: true, onError: () => { errored = true; } });
+  await flush();
+  scope._setVisibility('hidden');
+  scope._setVisibility('visible');
+  await flush();
+  assert.equal(errored, false); // a failed background check is not an error
 });
