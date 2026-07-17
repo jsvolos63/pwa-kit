@@ -510,7 +510,7 @@ export function registerServiceWorker(options = {}) {
         try {
           const up = reg.update();
           if (up && typeof up.catch === 'function') up.catch(() => {});
-        } catch (_) { /* update() unsupported — best-effort only */ }
+        } catch { /* update() unsupported — best-effort only */ }
       };
       const doc = scope && scope.document;
       if (updateOnVisible && doc && typeof doc.addEventListener === 'function') {
