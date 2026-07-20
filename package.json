@@ -1,6 +1,6 @@
 {
   "name": "@jfs/pwa-kit",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Shared, dependency-free service-worker primitives (versioned app-shell caching; cache-first / network-first / stale-while-revalidate / network-first-with-timeout strategies; multi-cache eviction) plus the page-side registerServiceWorker helper, extracted from the JFS family of buildless static PWAs.",
   "type": "module",
   "license": "MIT",

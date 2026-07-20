@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   cacheName,
+  cacheNamePrefix,
   resolveShellPaths,
   staleCacheKeys,
   routeRequest,
@@ -103,6 +104,15 @@ test('cacheName joins prefix and version', () => {
   assert.equal(cacheName('weather', '1.2.3'), 'weather-1.2.3');
 });
 
+test('cacheNamePrefix derives the app prefix with its trailing separator', () => {
+  assert.equal(cacheNamePrefix('myapp-2'), 'myapp-');
+  assert.equal(cacheNamePrefix('mm-shell-v42'), 'mm-shell-');
+  assert.equal(cacheNamePrefix('weather-1.2.3'), 'weather-');
+  assert.equal(cacheNamePrefix('noseparator'), 'noseparator'); // no version segment
+  // the trailing '-' keeps the scope from bleeding into a lookalike sibling
+  assert.ok(!'myapp2-v1'.startsWith(cacheNamePrefix('myapp-2')));
+});
+
 test('resolveShellPaths absolutizes relative + root paths', () => {
   const set = resolveShellPaths(['./', 'css/style.css', '/index.html'], new URL('https://app.test/'));
   assert.ok(set.has('/') && set.has('/css/style.css') && set.has('/index.html'));
@@ -137,6 +147,20 @@ test('shouldCacheResponse listed vs shellRouted', () => {
   assert.equal(shouldCacheResponse(new URL('https://a/index.html'), { ok: true, type: 'basic' }, 'listed', set), true);
   assert.equal(shouldCacheResponse(new URL('https://a/o.js'), { ok: true, type: 'basic' }, 'listed', set), false);
   assert.equal(shouldCacheResponse(new URL('https://a/x.js'), { ok: true, type: 'opaque' }, 'shellRouted', set), false);
+});
+
+test('shouldCacheResponse: redirected rejected by default (opt back in); listed requires basic', () => {
+  const set = new Set(['/index.html']);
+  const u = new URL('https://a/index.html');
+  // A redirected response is not cached by default in either mode…
+  assert.equal(shouldCacheResponse(u, { ok: true, type: 'basic', redirected: true }, 'listed', set), false);
+  assert.equal(shouldCacheResponse(u, { ok: true, type: 'basic', redirected: true }, 'shellRouted', set), false);
+  // …but the knob opts it back in.
+  assert.equal(shouldCacheResponse(u, { ok: true, type: 'basic', redirected: true }, 'listed', set, { allowRedirected: true }), true);
+  // 'listed' now also requires a same-origin ('basic') response, so a same-origin
+  // open-redirect that yields a cors/opaque body can't be cached under a shell path.
+  assert.equal(shouldCacheResponse(u, { ok: true, type: 'cors' }, 'listed', set), false);
+  assert.equal(shouldCacheResponse(u, { ok: true, type: 'basic' }, 'listed', set), true);
 });
 
 // ───────────────────────── new helpers (v0.2.0) ─────────────────────────
@@ -531,6 +555,32 @@ test('createServiceWorker still wires install/activate/fetch', async () => {
   await scope.caches.open('w-OLD');
   await scope._dispatch('activate', {});
   assert.ok(!(await scope.caches.keys()).includes('w-OLD'));
+});
+
+test('createServiceWorker: default activate prunes only its own prefix, spares a sibling app', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({ scope, cacheName: 'myapp-2', shell: ['/'] });
+  await scope.caches.open('myapp-1');       // this app's own stale cache
+  await scope.caches.open('myapp-2');       // current
+  await scope.caches.open('other-app-v3');  // a co-hosted SIBLING app's cache
+  await scope._dispatch('activate', {});
+  const keys = (await scope.caches.keys()).sort();
+  assert.ok(!keys.includes('myapp-1'), 'own stale cache should be pruned');
+  assert.ok(keys.includes('myapp-2'), 'current cache kept');
+  assert.ok(keys.includes('other-app-v3'), 'foreign sibling cache must NOT be deleted by a default prune');
+});
+
+test('createServiceWorker: serveCdn scopes lookups to its own bucket, not a sibling cache', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'], cdnHosts: ['unpkg.com'] });
+  // A sibling app on the same origin already cached this exact CDN URL.
+  const foreign = await scope.caches.open('other-app-v3');
+  await foreign.put('https://unpkg.com/a.js', makeResponse('foreign'));
+  const ev = await scope._dispatch('fetch', { request: { url: 'https://unpkg.com/a.js', method: 'GET', mode: 'cors' } });
+  assert.equal(ev._responseResolved.body, 'net'); // network, NOT the sibling's 'foreign' entry
+  await microtasks();
+  const own = await scope.caches.open('w-1');
+  assert.ok(await own.match('https://unpkg.com/a.js')); // written into its own bucket
 });
 
 // ───────────────── registerServiceWorker (page side) ─────────────────

@@ -46,6 +46,20 @@ export function cacheName(prefix, version) {
   return `${prefix}-${version}`;
 }
 
+/** Derive an app's cache-name PREFIX from one of its versioned cache names —
+ *  the portion before the version separator, kept WITH its trailing separator
+ *  so a startsWith() scope can't bleed into a sibling whose name merely shares
+ *  a leading substring (`myapp-` won't match `myapp2-v1`). Used to scope pruning
+ *  to the app's own caches on a shared origin (e.g. several family apps under
+ *  `username.github.io`), so one app's activate can't wipe another's shell.
+ *  `myapp-2` → `myapp-`; `mm-shell-v42` → `mm-shell-`; a name with no separator
+ *  is returned unchanged. */
+export function cacheNamePrefix(name) {
+  if (!name) return name;
+  const i = name.lastIndexOf('-');
+  return i === -1 ? name : name.slice(0, i + 1);
+}
+
 /** Resolve a shell list (which may contain relative paths like './' or
  *  'css/style.css') to a Set of absolute pathnames, against the SW's own
  *  location. */
@@ -155,11 +169,17 @@ export function routeRequest(url, request, config) {
 }
 
 /** Decide whether a successful shell response may enter the cache.
- *    'listed'      — only paths in the precache shell set (bounded cache).
- *    'shellRouted' — any same-origin ('basic') ok response routed as shell. */
-export function shouldCacheResponse(url, response, mode, shellPathSet) {
+ *    'listed'      — only paths in the precache shell set (bounded cache) AND a
+ *                    same-origin ('basic') response, so a same-origin
+ *                    open-redirect can't land a foreign body under a shell path.
+ *    'shellRouted' — any same-origin ('basic') ok response routed as shell.
+ *  `opts.allowRedirected` (default false) — reject `response.redirected` unless
+ *  opted back in; a redirected response's URL can't be trusted as the cache key. */
+export function shouldCacheResponse(url, response, mode, shellPathSet, opts = {}) {
+  const { allowRedirected = false } = opts;
   if (!response || !response.ok) return false;
-  if (mode === 'listed') return shellPathSet.has(url.pathname);
+  if (!allowRedirected && response.redirected) return false;
+  if (mode === 'listed') return response.type === 'basic' && shellPathSet.has(url.pathname);
   return response.type === 'basic';
 }
 
@@ -333,6 +353,7 @@ export function createServiceWorker(config) {
     matchOptions,
     notifyOnActivate = null,
     cachePrunePrefix = null,
+    allowRedirected = false,
     skipWaiting = true,
     clientsClaim = true,
   } = config;
@@ -363,18 +384,27 @@ export function createServiceWorker(config) {
   }
 
   async function onActivate() {
-    await pruneCaches(scope, CACHE, cachePrunePrefix);
+    // Prefix-scoped by DEFAULT: with no explicit cachePrunePrefix, derive the
+    // app's own prefix from CACHE so pruning only ever deletes this app's caches
+    // — a co-hosted sibling app's caches on the same origin are left untouched.
+    // An explicit cachePrunePrefix still opts into a caller-supplied scope.
+    const prunePrefix = cachePrunePrefix != null ? cachePrunePrefix : cacheNamePrefix(CACHE);
+    await pruneCaches(scope, CACHE, prunePrefix);
     if (clientsClaim) await claimClients(scope);
     if (notifyOnActivate) await notifyClients(scope, notifyOnActivate);
   }
 
   async function serveCdn(request) {
-    const hit = await scope.caches.match(request);
+    // Scope the lookup to this app's own CDN bucket. A bare
+    // scope.caches.match(request) searches EVERY cache on the origin and could
+    // return a sibling app's — or an older version's — entry for the same URL.
+    const cache = await scope.caches.open(CACHE);
+    const hit = await cache.match(request);
     if (hit) return hit;
     const res = await scope.fetch(request);
     if (res.ok) {
       const copy = res.clone();
-      scope.caches.open(CACHE).then((cache) => cache.put(request, copy)).catch(() => {});
+      safeCachePut(cache, request, copy);
     }
     return res;
   }
@@ -382,7 +412,7 @@ export function createServiceWorker(config) {
   async function serveShell(request, url) {
     try {
       const res = await scope.fetch(request, fetchInit);
-      if (shouldCacheResponse(url, res, cacheWhen, shellPathSet)) {
+      if (shouldCacheResponse(url, res, cacheWhen, shellPathSet, { allowRedirected })) {
         const copy = res.clone();
         scope.caches.open(CACHE).then((cache) => cache.put(request, copy)).catch(() => {});
       }
