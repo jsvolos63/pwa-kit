@@ -570,6 +570,21 @@ test('createServiceWorker: default activate prunes only its own prefix, spares a
   assert.ok(keys.includes('other-app-v3'), 'foreign sibling cache must NOT be deleted by a default prune');
 });
 
+test('createServiceWorker: cachePrefix prunes correctly when the version contains a hyphen', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  // Version `1.2.3-rc.1` has a `-`, which the last-`-` heuristic would mis-split
+  // (deriving `myapp-1.2.3-`). An explicit cachePrefix makes the scope robust.
+  createServiceWorker({ scope, cacheName: 'myapp-1.2.3-rc.1', cachePrefix: 'myapp', shell: ['/'] });
+  await scope.caches.open('myapp-1.2.2');       // this app's own stale cache
+  await scope.caches.open('myapp-1.2.3-rc.1');  // current
+  await scope.caches.open('other-app-v3');      // sibling
+  await scope._dispatch('activate', {});
+  const keys = (await scope.caches.keys()).sort();
+  assert.ok(!keys.includes('myapp-1.2.2'), 'own stale cache pruned despite hyphenated version');
+  assert.ok(keys.includes('myapp-1.2.3-rc.1'), 'current cache kept');
+  assert.ok(keys.includes('other-app-v3'), 'foreign sibling cache spared');
+});
+
 test('createServiceWorker: serveCdn scopes lookups to its own bucket, not a sibling cache', async () => {
   const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
   createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'], cdnHosts: ['unpkg.com'] });

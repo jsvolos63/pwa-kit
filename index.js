@@ -53,7 +53,14 @@ export function cacheName(prefix, version) {
  *  to the app's own caches on a shared origin (e.g. several family apps under
  *  `username.github.io`), so one app's activate can't wipe another's shell.
  *  `myapp-2` → `myapp-`; `mm-shell-v42` → `mm-shell-`; a name with no separator
- *  is returned unchanged. */
+ *  is returned unchanged.
+ *
+ *  CAVEAT: this splits on the LAST `-`, so it is only correct when the version
+ *  segment contains no `-`. A hyphenated version (semver prerelease/build, e.g.
+ *  `app-1.2.3-rc.1`) would derive `app-1.2.3-` and fail to match the app's own
+ *  prior caches (`app-1.2.2`), leaving them un-pruned. Apps whose version may
+ *  contain `-` MUST pass `cachePrefix` to the factory (or an explicit
+ *  `cachePrunePrefix`) rather than rely on this heuristic. */
 export function cacheNamePrefix(name) {
   if (!name) return name;
   const i = name.lastIndexOf('-');
@@ -353,6 +360,7 @@ export function createServiceWorker(config) {
     matchOptions,
     notifyOnActivate = null,
     cachePrunePrefix = null,
+    cachePrefix = null,
     allowRedirected = false,
     skipWaiting = true,
     clientsClaim = true,
@@ -384,11 +392,18 @@ export function createServiceWorker(config) {
   }
 
   async function onActivate() {
-    // Prefix-scoped by DEFAULT: with no explicit cachePrunePrefix, derive the
-    // app's own prefix from CACHE so pruning only ever deletes this app's caches
-    // — a co-hosted sibling app's caches on the same origin are left untouched.
-    // An explicit cachePrunePrefix still opts into a caller-supplied scope.
-    const prunePrefix = cachePrunePrefix != null ? cachePrunePrefix : cacheNamePrefix(CACHE);
+    // Prefix-scoped by DEFAULT so pruning only ever deletes this app's caches —
+    // a co-hosted sibling app's caches on the same origin are left untouched.
+    // Precedence: an explicit cachePrunePrefix wins; else the app's own
+    // `cachePrefix` (robust — works even when the version contains a `-`);
+    // else fall back to deriving it from CACHE via the last-`-` heuristic
+    // (correct only when the version has no `-`; see cacheNamePrefix caveat).
+    const prunePrefix =
+      cachePrunePrefix != null
+        ? cachePrunePrefix
+        : cachePrefix != null
+          ? (String(cachePrefix).endsWith('-') ? String(cachePrefix) : `${cachePrefix}-`)
+          : cacheNamePrefix(CACHE);
     await pruneCaches(scope, CACHE, prunePrefix);
     if (clientsClaim) await claimClients(scope);
     if (notifyOnActivate) await notifyClients(scope, notifyOnActivate);
