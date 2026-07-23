@@ -56,6 +56,34 @@ navigation ever re-checks `sw.js` and an update can go unnoticed for days),
 visible sessions; 0 = off).
 Classic-script pages read it off the global build as `PWAKit.registerServiceWorker`.
 
+**4. The family update UX (v0.6.0)** — the standard "New version available —
+tap to refresh" pill, extracted from the byte-similar copies BearsMockDraft
+and Surf-Tracker carried. Family policy: apps **never reload on their own** —
+a deploy shows the pill and the user decides.
+
+```js
+import { registerWithUpdatePrompt } from './pwa-kit/index.js';
+
+registerWithUpdatePrompt({
+  swUrl: '/sw.js',
+  prompt: { style: { background: '#0b162a', border: '1px solid #c83803' } },
+});
+```
+
+`registerWithUpdatePrompt` is `registerServiceWorker` preconfigured with the
+family defaults (`updateViaCache: 'none'`, `updateOnVisible`, register after
+`load`) plus the pill on a real upgrade; an app-supplied `onUpdate` still runs
+in addition (e.g. a diagnostics note). The pieces are exported separately —
+`showUpdatePrompt(options)` (idempotent pill; `label`/`id`/`style`/`onTap`;
+styles assigned via CSSOM so strict `style-src` CSPs need no allowance) and
+`applyUpdateAndReload(worker)` (the tap action). The tap is safe under BOTH
+family worker contracts: a worker already activated via install-time
+`skipWaiting` gets a plain reload, while a genuinely *waiting* worker (e.g. a
+`createServiceWorker({ skipWaiting: false })` + `onSkipWaiting` setup) is
+posted `SKIP_WAITING` and the reload rides `controllerchange`, with a timed
+fallback for workers that ignore the message. The `controllerchange` listener
+is bound only on tap, so the historic reload loop stays impossible.
+
 ## How it's consumed
 
 These are buildless sites, and a **classic** service worker can't `import` an
