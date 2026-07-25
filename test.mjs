@@ -602,6 +602,70 @@ test('createServiceWorker: serveCdn scopes lookups to its own bucket, not a sibl
   assert.ok(await own.match('https://unpkg.com/a.js')); // written into its own bucket
 });
 
+test('createServiceWorker: best-effort install also precaches the cdn list', async () => {
+  const scope = makeScope({ fetchImpl: async (url) => makeResponse('net:' + url) });
+  createServiceWorker({
+    scope,
+    cacheName: 'w-1',
+    shell: ['/', '/index.html'],
+    cdn: ['https://unpkg.com/a.js'],
+    cdnHosts: ['unpkg.com'],
+    installMode: 'best-effort',
+  });
+  await scope._dispatch('install', {});
+  const cache = await scope.caches.open('w-1');
+  assert.ok(await cache.match('/index.html'), 'shell precached');
+  assert.ok(await cache.match('https://unpkg.com/a.js'), 'cdn entry precached in best-effort mode too');
+});
+
+test('createServiceWorker: best-effort install tolerates a failing cdn add', async () => {
+  const scope = makeScope({ fetchImpl: async (url) => makeResponse('net:' + url) });
+  createServiceWorker({
+    scope,
+    cacheName: 'w-1',
+    shell: ['/'],
+    cdn: [{ url: 'https://unpkg.com/missing.js', _failAdd: true }],
+    installMode: 'best-effort',
+  });
+  const ev = await scope._dispatch('install', {});
+  assert.ok(ev, 'install completed despite the failing cdn add');
+  const cache = await scope.caches.open('w-1');
+  assert.ok(await cache.match('/'), 'shell still precached');
+});
+
+test('createServiceWorker: offline shell fallback is scoped to the app\'s own cache', async () => {
+  const scope = makeScope({ fetchImpl: async () => { throw new Error('offline'); } });
+  createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'] });
+  // A co-hosted sibling app cached this exact URL in ITS bucket.
+  const foreign = await scope.caches.open('other-app-v3');
+  await foreign.put('https://app.test/page.html', makeResponse('foreign'));
+  // The bare origin-wide caches.match() would have served 'foreign' here.
+  await assert.rejects(
+    () => scope._dispatch('fetch', { request: { url: 'https://app.test/page.html', method: 'GET', mode: 'cors' } }),
+    /offline/,
+  );
+  // …while a copy in the app's OWN cache is served normally.
+  const own = await scope.caches.open('w-1');
+  await own.put('https://app.test/page.html', makeResponse('mine'));
+  const ev = await scope._dispatch('fetch', { request: { url: 'https://app.test/page.html', method: 'GET', mode: 'cors' } });
+  assert.equal(ev._responseResolved.body, 'mine');
+});
+
+test('createServiceWorker: navigateFallback also resolves from the app\'s own cache only', async () => {
+  const scope = makeScope({ fetchImpl: async () => { throw new Error('offline'); } });
+  createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'], navigateFallback: '/index.html' });
+  const foreign = await scope.caches.open('other-app-v3');
+  await foreign.put('https://app.test/index.html', makeResponse('foreign-shell'));
+  await assert.rejects(
+    () => scope._dispatch('fetch', { request: { url: 'https://app.test/deep/route', method: 'GET', mode: 'navigate' } }),
+    /offline/,
+  );
+  const own = await scope.caches.open('w-1');
+  await own.put('https://app.test/index.html', makeResponse('own-shell'));
+  const ev = await scope._dispatch('fetch', { request: { url: 'https://app.test/deep/route', method: 'GET', mode: 'navigate' } });
+  assert.equal(ev._responseResolved.body, 'own-shell');
+});
+
 // ───────────────── registerServiceWorker (page side) ─────────────────
 
 function makeWorker(state = 'installing') {

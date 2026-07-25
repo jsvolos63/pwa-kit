@@ -110,12 +110,13 @@ const { networkFirst, staleWhileRevalidate, precache, pruneCaches } = self.PWAKi
 ## Status
 
 Promoted to its own repo (`github:jsvolos63/pwa-kit`), the same way
-[`@jfs/news-kit`](https://github.com/jsvolos63/news-kit) was. Consumers pin a
-tagged release (`"@jfs/pwa-kit": "github:jsvolos63/pwa-kit#v0.2.0"`) and their
-`scripts/vendor-pwa-kit.mjs` regenerates the vendored copies (`pwa-kit/index.js`
-for tests, `pwa-kit/sw-kit.global.js` for `importScripts`) from
-`node_modules/@jfs/pwa-kit/index.js`, with `npm run vendor:check` failing CI on
-drift.
+[`@jfs/news-kit`](https://github.com/jsvolos63/news-kit) was. Consumers pin the
+package by **full commit SHA**
+(`"@jfs/pwa-kit": "github:jsvolos63/pwa-kit#<commit-sha>"` — the auto-tagged
+`v<version>` releases give those SHAs readable names) and regenerate the
+vendored copies (`pwa-kit/index.js` for tests, `pwa-kit/sw-kit.global.js` for
+`importScripts`) with the kit's own CLI (`jfs-pwa-kit-vendor`, wired into each
+app's `npm run vendor:sync`), with `npm run vendor:check` failing CI on drift.
 
 ## Test
 
