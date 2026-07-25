@@ -24,6 +24,10 @@ import {
   networkFirstWithTimeout,
   createServiceWorker,
   registerServiceWorker,
+  registerWithUpdatePrompt,
+  showUpdatePrompt,
+  applyUpdateAndReload,
+  UPDATE_PROMPT_ID,
 } from './index.js';
 
 // ───────────────────────── shared fakes ─────────────────────────
@@ -804,4 +808,164 @@ test('registerServiceWorker: update() rejections from proactive checks are swall
   scope._setVisibility('visible');
   await flush();
   assert.equal(errored, false); // a failed background check is not an error
+});
+
+// ───────────────── update prompt (tap to refresh) ─────────────────
+
+// Minimal DOM fakes — enough for showUpdatePrompt's createElement/getElementById/
+// appendChild surface and applyUpdateAndReload's window surface.
+function makeFakeDoc(win) {
+  const byId = new Map();
+  const doc = {
+    defaultView: win,
+    body: {
+      children: [],
+      appendChild(el) { this.children.push(el); byId.set(el.id, el); },
+    },
+    getElementById(id) { return byId.get(id) || null; },
+    createElement(tag) {
+      const listeners = {};
+      return {
+        tagName: tag.toUpperCase(),
+        id: '',
+        type: '',
+        textContent: '',
+        style: { cssText: '' },
+        addEventListener(type, cb) { (listeners[type] ||= []).push(cb); },
+        click() { (listeners.click || []).forEach((cb) => cb()); },
+      };
+    },
+  };
+  if (win) win.document = doc;
+  return doc;
+}
+
+function makeFakeWin() {
+  const swListeners = {};
+  const timeouts = [];
+  const win = {
+    reloads: 0,
+    location: { reload() { win.reloads += 1; } },
+    navigator: {
+      serviceWorker: {
+        addEventListener(type, cb, opts) { (swListeners[type] ||= []).push({ cb, once: opts && opts.once }); },
+        _fireControllerChange() {
+          const list = swListeners.controllerchange || [];
+          swListeners.controllerchange = list.filter((l) => !l.once);
+          list.forEach((l) => l.cb());
+        },
+      },
+    },
+    setTimeout(fn, ms) { timeouts.push([fn, ms]); return timeouts.length; },
+    _runTimeouts() { const t = timeouts.splice(0); t.forEach(([fn]) => fn()); },
+  };
+  return win;
+}
+
+function makePromptWorker(state = 'installed') {
+  return { state, messages: [], postMessage(m) { this.messages.push(m); } };
+}
+
+test('showUpdatePrompt: builds the pill once, idempotent by id', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const pill = showUpdatePrompt({ doc });
+  assert.equal(pill.id, UPDATE_PROMPT_ID);
+  assert.equal(pill.type, 'button');
+  assert.match(pill.textContent, /New version available/);
+  assert.match(pill.style.cssText, /position:fixed/);
+  const again = showUpdatePrompt({ doc });
+  assert.equal(again, pill);
+  assert.equal(doc.body.children.length, 1);
+});
+
+test('showUpdatePrompt: label and style overrides merge over defaults', () => {
+  const doc = makeFakeDoc(makeFakeWin());
+  const pill = showUpdatePrompt({
+    doc,
+    label: 'Fresh build — tap',
+    style: { background: '#0b162a', border: '1px solid #c83803' },
+  });
+  assert.equal(pill.textContent, 'Fresh build — tap');
+  assert.match(pill.style.cssText, /background:#0b162a/);
+  assert.match(pill.style.cssText, /border:1px solid #c83803/);
+  assert.match(pill.style.cssText, /position:fixed/); // defaults survive
+});
+
+test('tap with an already-active worker reloads immediately', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const worker = makePromptWorker('activated');
+  showUpdatePrompt({ doc, worker }).click();
+  assert.equal(win.reloads, 1);
+  assert.equal(worker.messages.length, 0);
+});
+
+test('tap with a waiting worker posts SKIP_WAITING and reloads once on controllerchange', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const worker = makePromptWorker('installed');
+  showUpdatePrompt({ doc, worker }).click();
+  assert.equal(win.reloads, 0); // not yet — waiting for the new worker
+  assert.deepEqual(worker.messages, [{ type: 'SKIP_WAITING' }]);
+  win.navigator.serviceWorker._fireControllerChange();
+  assert.equal(win.reloads, 1);
+  win._runTimeouts(); // fallback timer must not double-reload
+  win.navigator.serviceWorker._fireControllerChange();
+  assert.equal(win.reloads, 1);
+});
+
+test('tap falls back to a timed reload when the worker ignores SKIP_WAITING', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  showUpdatePrompt({ doc, worker: makePromptWorker('installed') }).click();
+  assert.equal(win.reloads, 0);
+  win._runTimeouts();
+  assert.equal(win.reloads, 1);
+});
+
+test('applyUpdateAndReload: no worker → plain reload; postMessage throw → still reloads', () => {
+  const win = makeFakeWin();
+  applyUpdateAndReload(null, win);
+  assert.equal(win.reloads, 1);
+
+  const win2 = makeFakeWin();
+  const hostile = { state: 'installed', postMessage() { throw new Error('gone'); } };
+  applyUpdateAndReload(hostile, win2);
+  win2._runTimeouts();
+  assert.equal(win2.reloads, 1);
+});
+
+test('showUpdatePrompt: onTap override replaces the default action', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const worker = makePromptWorker('installed');
+  const taps = [];
+  showUpdatePrompt({ doc, worker, onTap: (w) => taps.push(w) }).click();
+  assert.deepEqual(taps, [worker]);
+  assert.equal(win.reloads, 0);
+});
+
+test('registerWithUpdatePrompt: family defaults + pill on a real upgrade', async () => {
+  const worker = makeWorker();
+  const scope = makePageScope({ controller: {}, installing: worker, readyState: 'complete' });
+  // Wire the DOM surface showUpdatePrompt needs onto the page scope.
+  makeFakeDoc(scope);
+  scope.document.readyState = 'complete';
+  scope.document.visibilityState = 'visible';
+  scope.document.addEventListener = () => {};
+  let alsoRan = 0;
+  registerWithUpdatePrompt({
+    scope,
+    prompt: { label: 'Update ready' },
+    onUpdate: () => { alsoRan += 1; },
+  });
+  await flush();
+  worker.setState('installed');
+  const pill = scope.document.getElementById(UPDATE_PROMPT_ID);
+  assert.ok(pill, 'pill shown on upgrade');
+  assert.equal(pill.textContent, 'Update ready');
+  assert.equal(alsoRan, 1); // app onUpdate runs in addition to the pill
+  // updateViaCache 'none' default reached register()
+  assert.deepEqual(scope.calls.register[0][1], { updateViaCache: 'none' });
 });
