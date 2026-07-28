@@ -589,6 +589,65 @@ test('createServiceWorker: cachePrefix prunes correctly when the version contain
   assert.ok(keys.includes('other-app-v3'), 'foreign sibling cache spared');
 });
 
+test("createServiceWorker: cachePrunePrefix:'' is ignored — it must not wipe a sibling app", async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  // '' is the natural way an app spells "don't scope the prune". Honoring it
+  // would reach staleCacheKeys' unscoped branch and delete EVERY other cache on
+  // the origin. It falls through to the derived prefix instead.
+  createServiceWorker({ scope, cacheName: 'myapp-2', shell: ['/'], cachePrunePrefix: '' });
+  await scope.caches.open('myapp-1');
+  await scope.caches.open('myapp-2');
+  await scope.caches.open('other-app-v3');
+  await scope._dispatch('activate', {});
+  const keys = await scope.caches.keys();
+  assert.ok(keys.includes('other-app-v3'), "cachePrunePrefix:'' must NOT delete a co-hosted app's cache");
+  assert.ok(keys.includes('myapp-2'), 'current cache kept');
+  assert.ok(!keys.includes('myapp-1'), 'own stale cache still pruned via the derived prefix');
+});
+
+test("createServiceWorker: cachePrefix:'' is ignored — pruning is not silently disabled", async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  // Honoring '' would derive the prefix '-', which matches nothing, so every
+  // past version's cache would accumulate until quota.
+  createServiceWorker({ scope, cacheName: 'myapp-2', shell: ['/'], cachePrefix: '' });
+  await scope.caches.open('myapp-1');
+  await scope.caches.open('myapp-2');
+  await scope.caches.open('other-app-v3');
+  await scope._dispatch('activate', {});
+  const keys = await scope.caches.keys();
+  assert.ok(!keys.includes('myapp-1'), "cachePrefix:'' must not disable pruning of this app's stale caches");
+  assert.ok(keys.includes('myapp-2'), 'current cache kept');
+  assert.ok(keys.includes('other-app-v3'), 'foreign sibling cache spared');
+});
+
+test("createServiceWorker: cachePrunePrefix:'' still defers to a non-empty cachePrefix", async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({
+    scope, cacheName: 'myapp-1.2.3-rc.1', shell: ['/'], cachePrunePrefix: '', cachePrefix: 'myapp',
+  });
+  await scope.caches.open('myapp-1.2.2');
+  await scope.caches.open('myapp-1.2.3-rc.1');
+  await scope.caches.open('other-app-v3');
+  await scope._dispatch('activate', {});
+  const keys = await scope.caches.keys();
+  assert.ok(!keys.includes('myapp-1.2.2'), 'the empty prune prefix falls through to cachePrefix');
+  assert.ok(keys.includes('other-app-v3'), 'foreign sibling cache spared');
+});
+
+test('createServiceWorker: a non-empty cachePrunePrefix still wins outright', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({
+    scope, cacheName: 'myapp-2', shell: ['/'], cachePrunePrefix: 'legacy-', cachePrefix: 'myapp',
+  });
+  await scope.caches.open('legacy-1');
+  await scope.caches.open('myapp-1');
+  await scope.caches.open('myapp-2');
+  await scope._dispatch('activate', {});
+  const keys = await scope.caches.keys();
+  assert.ok(!keys.includes('legacy-1'), 'explicit prune prefix applied');
+  assert.ok(keys.includes('myapp-1'), 'out-of-scope cache untouched (behavior unchanged)');
+});
+
 test('createServiceWorker: serveCdn scopes lookups to its own bucket, not a sibling cache', async () => {
   const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
   createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'], cdnHosts: ['unpkg.com'] });

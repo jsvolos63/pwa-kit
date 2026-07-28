@@ -415,12 +415,21 @@ export function createServiceWorker(config) {
     // `cachePrefix` (robust — works even when the version contains a `-`);
     // else fall back to deriving it from CACHE via the last-`-` heuristic
     // (correct only when the version has no `-`; see cacheNamePrefix caveat).
-    const prunePrefix =
-      cachePrunePrefix != null
-        ? cachePrunePrefix
-        : cachePrefix != null
-          ? (String(cachePrefix).endsWith('-') ? String(cachePrefix) : `${cachePrefix}-`)
-          : cacheNamePrefix(CACHE);
+    //
+    // Each step requires a NON-EMPTY STRING. An empty string is the obvious way
+    // an app tries to spell "don't scope the prune", and both spellings misfire:
+    // `cachePrunePrefix: ''` reaches staleCacheKeys' unscoped branch and deletes
+    // EVERY other cache on the origin — a co-hosted sibling app's shell included,
+    // the regression the prefix scoping exists to prevent — while
+    // `cachePrefix: ''` derives the prefix `'-'`, which matches nothing, so every
+    // past version's cache accumulates until quota. Neither is honored: an empty
+    // (or non-string) value is ignored and the chain falls through.
+    const usable = (v) => typeof v === 'string' && v !== '';
+    const prunePrefix = usable(cachePrunePrefix)
+      ? cachePrunePrefix
+      : usable(cachePrefix)
+        ? (cachePrefix.endsWith('-') ? cachePrefix : `${cachePrefix}-`)
+        : cacheNamePrefix(CACHE);
     await pruneCaches(scope, CACHE, prunePrefix);
     if (clientsClaim) await claimClients(scope);
     if (notifyOnActivate) await notifyClients(scope, notifyOnActivate);
