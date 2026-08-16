@@ -26,10 +26,11 @@
     "bin"
   ],
   "scripts": {
-    "test": "node --test test.mjs test-vendor.mjs"
+    "test": "node --test test.mjs test-vendor.mjs",
+    "kit-pins:bump": "jfs-bump-kit-pins"
   },
   "dependencies": {
-    "@jfs/vendor-cli": "github:jsvolos63/vendor-cli#61ec3f6b17a29b870fb63101bce3e309e8e1d2df"
+    "@jfs/vendor-cli": "github:jsvolos63/vendor-cli#e2f2476a92061b3a5268cb87b5ddac5ee179bf86"
   },
   "keywords": [
     "service-worker",
