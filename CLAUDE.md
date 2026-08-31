@@ -8,8 +8,6 @@ buildless static PWAs. Consumers vendor this kit via its own CLI rather
 than installing it at runtime, so a change here reaches an app only once
 that app bumps its pin and re-runs `vendor:sync`.
 
-<!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
-
 ## Lint
 
 `npm run lint` (ESLint flat config, `eslint.config.mjs`); CI runs it. Every
@@ -30,6 +28,8 @@ and the strategies, which must never touch `document`/`window`) and the page
 half (`registerServiceWorker`, `showUpdatePrompt`, which must). It is one
 file, so both global sets are on and lint cannot tell them apart; that split
 is the suite's job, not the linter's.
+
+<!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 
 ## Family conventions
 
