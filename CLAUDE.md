@@ -8,6 +8,27 @@ buildless static PWAs. Consumers vendor this kit via its own CLI rather
 than installing it at runtime, so a change here reaches an app only once
 that app bumps its pin and re-runs `vendor:sync`.
 
+## Lint
+
+`npm run lint` (ESLint flat config, `eslint.config.mjs`); CI runs it. Every
+APP in the family already linted; none of the kits did — which left the
+family's widest-blast-radius code as the code with no second reader, since a
+bug here lands in every consumer's vendored copy as bundler output nobody
+reads line by line.
+
+`index.js` came back clean. The two findings were both in the suite: a
+`cacheName` parameter in `test.mjs` shadowing the suite's own imported
+`cacheName()` (renamed to `name`), and `no-regex-spaces` firing on
+`test-vendor.mjs`'s deliberate two-space-indent match against generated
+output — that rule is off, with the reason inline.
+
+One thing the config does NOT try to enforce: `index.js` spans two scopes
+that must never be confused — the service-worker half (`createServiceWorker`
+and the strategies, which must never touch `document`/`window`) and the page
+half (`registerServiceWorker`, `showUpdatePrompt`, which must). It is one
+file, so both global sets are on and lint cannot tell them apart; that split
+is the suite's job, not the linter's.
+
 <!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 
 ## Family conventions
