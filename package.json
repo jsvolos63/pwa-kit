@@ -27,6 +27,7 @@
   ],
   "scripts": {
     "test": "node --test test.mjs test-vendor.mjs",
+    "lint": "eslint .",
     "kit-pins:bump": "jfs-bump-kit-pins"
   },
   "dependencies": {
@@ -38,5 +39,10 @@
     "offline",
     "app-shell",
     "cache"
-  ]
+  ],
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "globals": "^17.11.0"
+  }
 }

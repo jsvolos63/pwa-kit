@@ -100,7 +100,9 @@ function makeScope({ origin = 'https://app.test', fetchImpl } = {}) {
   return scope;
 }
 
-const ctxFor = (scope, cacheName, extra = {}) => ({ scope, cacheName, ...extra });
+// Param named `name`, not `cacheName`: the latter is this suite's imported
+// cacheName() and shadowing it here hid the function under a string.
+const ctxFor = (scope, name, extra = {}) => ({ scope, cacheName: name, ...extra });
 
 // ───────────────────────── pure helpers (v0.1.0) ─────────────────────────
 
