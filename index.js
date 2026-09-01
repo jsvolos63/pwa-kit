@@ -393,7 +393,15 @@ export function createServiceWorker(config) {
       await Promise.all([
         ...shell.map((url) =>
           scope.fetch(url, fetchInit)
-            .then((res) => res.ok && cache.put(url, res))
+            // The same predicate the runtime path applies: `res.ok` alone let
+            // a shell entry that 302s (an auth wall, a CDN edge redirect) be
+            // cached under its ORIGINAL path at install, and every later
+            // cache-fallback served it. The all-or-nothing branch's
+            // cache.addAll refuses redirects itself, so the two install modes
+            // disagreed on a security property.
+            .then((res) => shouldCacheResponse(
+              new URL(url, scope.location.href), res, 'shellRouted', shellPathSet, { allowRedirected },
+            ) && cache.put(url, res))
             .catch(() => {})),
         // `cdn` entries are precached best-effort in BOTH install modes (they
         // were previously dropped here, so a best-effort app's CDN assets only
@@ -579,6 +587,15 @@ export function registerServiceWorker(options = {}) {
       // `installing` nor `updatefound` covers that — announce it directly so an
       // update that's been ready since last time isn't silently stranded.
       if (reg.waiting && nav.serviceWorker.controller) announce(reg.waiting);
+      // And under the factory's default contract (skipWaiting on, claim off —
+      // what every factory consumer runs) a new worker is never `waiting`: it
+      // goes installed → activated while the OLD worker keeps controlling
+      // this page. If it got there before this listener attached, none of
+      // the three hooks above fire. An active worker that is not the one
+      // controlling us is that update.
+      if (reg.active && nav.serviceWorker.controller && reg.active !== nav.serviceWorker.controller) {
+        announce(reg.active);
+      }
       // Proactive update checks. Browsers only re-check sw.js on navigation,
       // which a resumed iOS home-screen PWA never performs — so without these
       // the onUpdate prompt can lag a deploy by days.
