@@ -679,6 +679,31 @@ test('createServiceWorker: best-effort install also precaches the cdn list', asy
   assert.ok(await cache.match('https://unpkg.com/a.js'), 'cdn entry precached in best-effort mode too');
 });
 
+test('createServiceWorker: best-effort install refuses a redirected or foreign shell response', async () => {
+  // `res.ok` alone cached a shell entry that 302'd under its ORIGINAL path,
+  // and the runtime cache-fallback served it forever after; cache.addAll in
+  // the all-or-nothing mode refuses redirects itself, so the two install
+  // modes disagreed on a security property.
+  const scope = makeScope({
+    fetchImpl: async (url) => {
+      if (String(url).includes('redirected')) return makeResponse('elsewhere', { redirected: true });
+      if (String(url).includes('foreign')) return makeResponse('cors', { type: 'cors' });
+      return makeResponse('net:' + url);
+    },
+  });
+  createServiceWorker({
+    scope,
+    cacheName: 'w-1',
+    shell: ['/', '/redirected.html', '/foreign.js'],
+    installMode: 'best-effort',
+  });
+  await scope._dispatch('install', {});
+  const cache = await scope.caches.open('w-1');
+  assert.ok(await cache.match('/'), 'a plain same-origin entry is precached');
+  assert.equal(await cache.match('/redirected.html'), undefined, 'a redirected response is not cached under the original path');
+  assert.equal(await cache.match('/foreign.js'), undefined, 'a non-basic response is not cached');
+});
+
 test('createServiceWorker: best-effort install tolerates a failing cdn add', async () => {
   const scope = makeScope({ fetchImpl: async (url) => makeResponse('net:' + url) });
   createServiceWorker({
@@ -741,12 +766,13 @@ function makeWorker(state = 'installing') {
 
 // A window-like scope. `controller` mimics navigator.serviceWorker.controller
 // (null on first-ever install, non-null once a worker controls the page).
-function makePageScope({ controller = null, installing = makeworkerOrNull(), supported = true, readyState = 'loading', waiting = null } = {}) {
+function makePageScope({ controller = null, installing = makeworkerOrNull(), supported = true, readyState = 'loading', waiting = null, active = null } = {}) {
   const regListeners = {};
   const calls = { register: [], update: 0, intervals: [] };
   const registration = {
     installing,
     waiting,
+    active,
     addEventListener(type, cb) { (regListeners[type] ||= []).push(cb); },
     _emit(type, arg) { (regListeners[type] || []).forEach((cb) => cb(arg)); },
     setInstalling(w) { this.installing = w; },
@@ -851,6 +877,35 @@ test('registerServiceWorker: fires onUpdate for a worker already waiting from a 
   await flush();
   assert.equal(updated, 1);
   assert.equal(seen, scope.registration.waiting);
+});
+
+test('registerServiceWorker: announces a worker that is already ACTIVE but not controlling this page', async () => {
+  // The factory default (skipWaiting on, claim off) never leaves a new
+  // worker in `waiting`: it activates while the old one keeps controlling
+  // the page. Reached `activated` before the page attached its listeners →
+  // none of installing / updatefound / waiting fire. reg.active !== controller
+  // is that update.
+  const controller = makeWorker('activated');
+  const fresh = makeWorker('activated');
+  const scope = makePageScope({ controller, installing: null, waiting: null, active: fresh });
+  let seen = null;
+  registerServiceWorker({ scope, onUpdate: (w) => { seen = w; } });
+  await flush();
+  assert.equal(seen, fresh);
+});
+
+test('registerServiceWorker: the controlling worker itself is never announced as an update', async () => {
+  const controller = makeWorker('activated');
+  const scope = makePageScope({ controller, installing: null, waiting: null, active: controller });
+  let updated = 0;
+  registerServiceWorker({ scope, onUpdate: () => { updated += 1; } });
+  await flush();
+  assert.equal(updated, 0);
+  // And on a first install (no controller) an active worker is not news either.
+  const first = makePageScope({ controller: null, installing: null, waiting: null, active: makeWorker('activated') });
+  registerServiceWorker({ scope: first, onUpdate: () => { updated += 1; } });
+  await flush();
+  assert.equal(updated, 0);
 });
 
 test('registerServiceWorker: does NOT announce a waiting worker on first install (no controller)', async () => {
