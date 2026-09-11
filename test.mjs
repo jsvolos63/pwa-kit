@@ -295,6 +295,54 @@ test('networkFirstWithTimeout: fast network passes through and caches', async ()
   assert.ok(await cache.match('https://app.test/.netlify/functions/q'));
 });
 
+// A scope whose timers are inert and recorded, so the suite can see whether a
+// request left one armed behind it. makeScope's setTimeout fires on the next
+// microtask and has no clearTimeout, so it can't observe a leak.
+function makeTimerScope(fetchImpl) {
+  const base = new URL('https://app.test/');
+  const armed = [];
+  const cleared = [];
+  let nextId = 1;
+  return {
+    location: base,
+    caches: new FakeCaches(base),
+    fetch: fetchImpl,
+    setTimeout: (fn, ms) => { const id = nextId++; armed.push({ id, fn, ms }); return id; },
+    clearTimeout: (id) => { cleared.push(id); },
+    _armed: armed,
+    _cleared: cleared,
+  };
+}
+
+test('networkFirstWithTimeout: a network that wins the race clears the fallback timer', async () => {
+  // The timer used to be armed and dropped on the floor: every request left a
+  // pending timeout that outlived its own answer, woke the worker for a
+  // pointless cache.match, and kept the worker alive while it was pending.
+  const scope = makeTimerScope(async () => makeResponse('net'));
+  const r = await networkFirstWithTimeout({ url: 'https://app.test/q' }, ctxFor(scope, 'api', { timeoutMs: 50 }));
+  assert.equal(r.body, 'net');
+  assert.equal(scope._armed.length, 1, 'the fallback timer is still armed up front');
+  assert.deepEqual(scope._cleared, [scope._armed[0].id], 'and cleared once the network answers');
+});
+
+test('networkFirstWithTimeout: the fallback timer is cleared on the error path too', async () => {
+  const scope = makeTimerScope(async () => { throw new Error('offline'); });
+  const cache = await scope.caches.open('api');
+  await cache.put('https://app.test/q', makeResponse('warm'));
+  const r = await networkFirstWithTimeout({ url: 'https://app.test/q' }, ctxFor(scope, 'api', { timeoutMs: 50 }));
+  assert.equal(r.body, 'warm');
+  assert.deepEqual(scope._cleared, [scope._armed[0].id]);
+});
+
+test('networkFirstWithTimeout: a scope with no clearTimeout still works (injected fakes)', async () => {
+  // The scope is dependency-injected and consumers' hand-built fake scopes
+  // supply setTimeout without its counterpart — clearing must stay guarded.
+  const scope = makeTimerScope(async () => makeResponse('net'));
+  delete scope.clearTimeout;
+  const r = await networkFirstWithTimeout({ url: 'https://app.test/q' }, ctxFor(scope, 'api', { timeoutMs: 50 }));
+  assert.equal(r.body, 'net');
+});
+
 test('networkFirstWithTimeout: slow network falls back to cached copy', async () => {
   let resolveNet;
   const scope = makeScope({ fetchImpl: () => new Promise((res) => { resolveNet = () => res(makeResponse('slow')); }) });
@@ -561,6 +609,25 @@ test('createServiceWorker still wires install/activate/fetch', async () => {
   await scope.caches.open('w-OLD');
   await scope._dispatch('activate', {});
   assert.ok(!(await scope.caches.keys()).includes('w-OLD'));
+});
+
+test('createServiceWorker: clients.claim() is OFF by default — the family update contract', async () => {
+  // The convention forbids swapping the controlling worker under an open page.
+  // The default used to be `true`, and only the fact that every consumer passed
+  // `clientsClaim: false` by hand kept the family compliant.
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'] });
+  await scope._dispatch('install', {});
+  await scope._dispatch('activate', {});
+  assert.equal(scope.skipWaitingCalled, true, 'skipWaiting stays on by default');
+  assert.equal(scope.claimCalled, false, 'a new worker must not seize the open page');
+});
+
+test('createServiceWorker: clientsClaim:true is still honored when asked for explicitly', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'], clientsClaim: true });
+  await scope._dispatch('activate', {});
+  assert.equal(scope.claimCalled, true);
 });
 
 test('createServiceWorker: default activate prunes only its own prefix, spares a sibling app', async () => {
@@ -976,6 +1043,36 @@ test('registerServiceWorker: updateIntervalMs wires a periodic update() check', 
   tick();
   tick();
   assert.equal(scope.calls.update, 2);
+});
+
+test('registerServiceWorker: the returned handle stops the periodic update() check', async () => {
+  const cleared = [];
+  const scope = makePageScope({ controller: {} });
+  let nextId = 7;
+  scope.setInterval = (fn, ms) => { const id = nextId++; scope.calls.intervals.push([fn, ms]); return id; };
+  scope.clearInterval = (id) => cleared.push(id);
+  const handle = registerServiceWorker({ scope, updateIntervalMs: 1000 });
+  await flush();
+  assert.equal(scope.calls.intervals.length, 1);
+  handle.stop();
+  assert.deepEqual(cleared, [7]);
+});
+
+test('registerServiceWorker: stop() before registration resolves never arms the interval', async () => {
+  // register() is async, so the caller holds the handle before the interval
+  // exists — stopping then must still prevent the poll from starting.
+  const scope = makePageScope({ controller: {} });
+  const handle = registerServiceWorker({ scope, updateIntervalMs: 1000 });
+  handle.stop();
+  await flush();
+  assert.equal(scope.calls.intervals.length, 0);
+});
+
+test('registerServiceWorker: a handle is returned even on an unsupported scope', async () => {
+  const scope = makePageScope({ supported: false });
+  const handle = registerServiceWorker({ scope });
+  assert.equal(typeof handle.stop, 'function');
+  assert.doesNotThrow(() => handle.stop());
 });
 
 test('registerServiceWorker: update() rejections from proactive checks are swallowed', async () => {
