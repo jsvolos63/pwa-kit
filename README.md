@@ -53,7 +53,9 @@ the page `load` event), `onUpdate(worker, registration)`, `onError(err)`,
 the foreground — iOS home-screen PWAs are *resumed*, not relaunched, so no
 navigation ever re-checks `sw.js` and an update can go unnoticed for days),
 `updateIntervalMs` (additionally re-check on a slow interval for long-lived
-visible sessions; 0 = off).
+visible sessions; 0 = off). It returns a `{ stop() }` handle that cancels that
+interval — safe to call before registration has resolved, and a no-op when no
+interval was asked for.
 Classic-script pages read it off the global build as `PWAKit.registerServiceWorker`.
 
 **4. The family update UX (v0.6.0)** — the standard "New version available —

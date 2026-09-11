@@ -102,7 +102,18 @@ export function staleCacheKeys(keys, keep, prefix) {
  *    requireBasic     — only same-origin ('basic') responses.
  *    allowRedirected  — when false, reject res.redirected (can't trust the URL).
  *    status           — require an exact status (e.g. 200), excluding other 2xx.
- *  The default predicate is simply `res.ok`. */
+ *  The default predicate is simply `res.ok`.
+ *
+ *  NOTE this defaults `allowRedirected` TRUE while `shouldCacheResponse`
+ *  defaults it FALSE, and the divergence is deliberate rather than an
+ *  oversight. `shouldCacheResponse` gates the SHELL path, where the cache key
+ *  is a path out of a fixed precache list and a same-origin open-redirect
+ *  could land a foreign body under it. This builds a predicate for arbitrary
+ *  RUNTIME caching, where the key is whatever request the app itself chose to
+ *  make and following a redirect is ordinary (a museum image CDN, an API
+ *  edge). Flipping it here would silently stop caching redirected responses
+ *  for every caller that never opted in. Pass `allowRedirected: false`
+ *  explicitly where the stricter gate is wanted, as market-monitor does. */
 export function makeCacheable(opts = {}) {
   const { allowOpaque = false, requireBasic = false, allowRedirected = true, status = null } = opts;
   return (res) => {
@@ -325,13 +336,25 @@ export async function networkFirstWithTimeout(request, ctx) {
     return resp;
   });
 
+  // Keep the timer id so a network that wins the race can cancel it. Without
+  // this every request armed a timer that outlived its own answer and then
+  // woke the worker for a pointless cache.match — one per request, and a
+  // service worker is kept alive by its pending timers.
+  let timer = null;
   const timed = new Promise((resolve) => {
-    ctx.scope.setTimeout(async () => {
+    timer = ctx.scope.setTimeout(async () => {
       if (settled) return;
       const cached = await cache.match(key, ctx.matchOptions);
       if (cached) resolve(cached);
     }, ctx.timeoutMs);
   });
+  // Guarded: a scope is dependency-injected, and the hand-built fake scopes in
+  // this kit's consumers' suites supply setTimeout without its counterpart.
+  const clearTimer = () => {
+    if (timer != null && ctx.scope && typeof ctx.scope.clearTimeout === 'function') {
+      ctx.scope.clearTimeout(timer);
+    }
+  };
 
   try {
     const raced = (await Promise.race([network, timed])) || network;
@@ -345,6 +368,8 @@ export async function networkFirstWithTimeout(request, ctx) {
     if (cached) return cached;
     if (ctx.fallback) return ctx.fallback();
     throw e;
+  } finally {
+    clearTimer();
   }
 }
 
@@ -373,8 +398,18 @@ export function createServiceWorker(config) {
     cachePrunePrefix = null,
     cachePrefix = null,
     allowRedirected = false,
+    // The family's Service-worker-updates contract, as the DEFAULT rather than
+    // as something every consumer has to remember to ask for: skipWaiting on,
+    // claim OFF. A new worker activates at once but never seizes the page that
+    // is already open — the reader keeps the shell he launched until the pill
+    // is tapped or he relaunches. `clientsClaim` defaulted to true, which is
+    // the one policy the convention forbids, and the divergence was invisible:
+    // every factory consumer in the family (BearsMockDraft, FlightCheck,
+    // Weather, Surf-Tracker, John's News) passes `clientsClaim: false` by hand,
+    // so nothing exercised the default and the comment on the page side below
+    // already described the contract as "skipWaiting on, claim off".
     skipWaiting = true,
-    clientsClaim = true,
+    clientsClaim = false,
   } = config;
 
   if (!CACHE) throw new Error('createServiceWorker: config.cacheName is required');
@@ -540,7 +575,11 @@ export function createServiceWorker(config) {
  * @param {number} [options.updateIntervalMs=0] additionally call
  *   registration.update() on this interval (0 = off) so long-lived visible
  *   sessions also notice a deploy.
- * @returns {void}
+ * @returns {{stop: () => void}} a handle whose `stop()` cancels the
+ *   `updateIntervalMs` poll. Registration is async, so the interval may not be
+ *   armed yet when the caller gets the handle — `stop()` covers both orders,
+ *   and is a no-op when no interval was asked for. (The function returned
+ *   `undefined` before, so the added shape breaks no caller.)
  */
 export function registerServiceWorker(options = {}) {
   const {
@@ -554,8 +593,22 @@ export function registerServiceWorker(options = {}) {
     updateIntervalMs = 0,
   } = options;
 
+  // `stopped` is checked when the interval is finally armed, so a stop() that
+  // lands before register() resolves still prevents the poll from starting.
+  let intervalId = null;
+  let stopped = false;
+  const handle = {
+    stop() {
+      stopped = true;
+      if (intervalId != null && scope && typeof scope.clearInterval === 'function') {
+        scope.clearInterval(intervalId);
+      }
+      intervalId = null;
+    },
+  };
+
   const nav = scope && scope.navigator;
-  if (!nav || !('serviceWorker' in nav)) return;
+  if (!nav || !('serviceWorker' in nav)) return handle;
 
   const doRegister = () => {
     const p = registerOptions
@@ -588,11 +641,11 @@ export function registerServiceWorker(options = {}) {
       // update that's been ready since last time isn't silently stranded.
       if (reg.waiting && nav.serviceWorker.controller) announce(reg.waiting);
       // And under the factory's default contract (skipWaiting on, claim off —
-      // what every factory consumer runs) a new worker is never `waiting`: it
-      // goes installed → activated while the OLD worker keeps controlling
-      // this page. If it got there before this listener attached, none of
-      // the three hooks above fire. An active worker that is not the one
-      // controlling us is that update.
+      // now the literal default, not just what every consumer passes by hand)
+      // a new worker is never `waiting`: it goes installed → activated while
+      // the OLD worker keeps controlling this page. If it got there before
+      // this listener attached, none of the three hooks above fire. An active
+      // worker that is not the one controlling us is that update.
       if (reg.active && nav.serviceWorker.controller && reg.active !== nav.serviceWorker.controller) {
         announce(reg.active);
       }
@@ -611,8 +664,8 @@ export function registerServiceWorker(options = {}) {
           if (doc.visibilityState === 'visible') checkForUpdate();
         });
       }
-      if (updateIntervalMs > 0 && scope && typeof scope.setInterval === 'function') {
-        scope.setInterval(checkForUpdate, updateIntervalMs);
+      if (updateIntervalMs > 0 && !stopped && scope && typeof scope.setInterval === 'function') {
+        intervalId = scope.setInterval(checkForUpdate, updateIntervalMs);
       }
     }).catch((err) => {
       if (typeof onError === 'function') onError(err);
@@ -631,6 +684,8 @@ export function registerServiceWorker(options = {}) {
   } else {
     doRegister();
   }
+
+  return handle;
 }
 
 // ───────────────────────── update prompt (tap to refresh) ─────────────────────────
@@ -750,7 +805,7 @@ export function showUpdatePrompt(options = {}) {
  * auto-reload). All registerServiceWorker options pass through and win over
  * the defaults; `prompt` carries showUpdatePrompt options (label/id/style/
  * onTap). An app-supplied onUpdate runs IN ADDITION to the pill (e.g. to
- * also surface a diagnostics note).
+ * also surface a diagnostics note). Returns registerServiceWorker's handle.
  */
 export function registerWithUpdatePrompt(options = {}) {
   const { prompt, onUpdate, ...rest } = options;
@@ -759,7 +814,7 @@ export function registerWithUpdatePrompt(options = {}) {
   const doc = (prompt && prompt.doc)
     || (rest.scope && rest.scope.document)
     || (typeof globalThis.document !== 'undefined' ? globalThis.document : null);
-  registerServiceWorker({
+  return registerServiceWorker({
     registerOptions: { updateViaCache: 'none' },
     updateOnVisible: true,
     waitForLoad: true,
