@@ -3,6 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   cacheName,
   cacheNamePrefix,
@@ -1245,4 +1246,130 @@ test('registerWithUpdatePrompt: family defaults + pill on a real upgrade', async
   assert.equal(alsoRan, 1); // app onUpdate runs in addition to the pill
   // updateViaCache 'none' default reached register()
   assert.deepEqual(scope.calls.register[0][1], { updateViaCache: 'none' });
+});
+
+// ───────────────── the worker / page scope split ─────────────────
+//
+// index.js is ONE file spanning two runtimes: everything above the
+// "page side (registration)" banner runs inside a service worker, where
+// `document`, `window` and Web Storage do not exist; everything below it runs
+// on the page. eslint.config.mjs switches on BOTH global sets for the file, so
+// `no-undef` cannot see a page global used on the worker side, and the rest of
+// this suite runs in bare Node against injected fakes — a bare `document` in a
+// worker-side function throws only if some case happens to execute that exact
+// line. This reads the source instead, so the rule holds whether or not a test
+// reaches the line. A violation ships to every consumer as a service worker that
+// dies on install or on its first fetch.
+
+const INDEX_SOURCE = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
+const PAGE_BANNER = /^\/\/ ─+ page side \(registration\) ─+$/m;
+const PAGE_ONLY_GLOBALS = /\b(document|window|localStorage|sessionStorage)\b/g;
+
+// Code with comments and string/template TEXT removed; `${…}` expressions are
+// kept, since code inside a template literal is still code. index.js carries no
+// regex literals; the export-survival assertion below is what fails, loudly,
+// if a future one confuses this scanner into swallowing code.
+function codeOnly(src) {
+  let i = 0;
+  function code(untilBrace) {
+    let out = '';
+    let depth = 0;
+    while (i < src.length) {
+      const c = src[i];
+      const d = src[i + 1];
+      if (c === '/' && d === '/') { while (i < src.length && src[i] !== '\n') i++; continue; }
+      if (c === '/' && d === '*') {
+        const end = src.indexOf('*/', i + 2);
+        i = end < 0 ? src.length : end + 2;
+        out += ' ';
+        continue;
+      }
+      if (c === "'" || c === '"') {
+        i++;
+        while (i < src.length && src[i] !== c) { if (src[i] === '\\') i++; i++; }
+        i++;
+        out += ' "" ';
+        continue;
+      }
+      if (c === '`') { i++; out += ' `' + template() + '` '; continue; }
+      if (untilBrace) {
+        if (c === '{') depth++;
+        else if (c === '}') {
+          if (depth === 0) { i++; return out; }
+          depth--;
+        }
+      }
+      out += c;
+      i++;
+    }
+    return out;
+  }
+  function template() {
+    let out = '';
+    while (i < src.length) {
+      const c = src[i];
+      if (c === '\\') { i += 2; continue; }
+      if (c === '`') { i++; return out; }
+      if (c === '$' && src[i + 1] === '{') { i += 2; out += ' ${ ' + code(true) + ' } '; continue; }
+      i++;
+    }
+    return out;
+  }
+  return code(false);
+}
+
+function pageGlobalsIn(src) {
+  return [...codeOnly(src).matchAll(PAGE_ONLY_GLOBALS)].map((m) => m[1]);
+}
+
+function exportsDeclaredIn(src) {
+  return [...src.matchAll(/^export\s+(?:async\s+)?(?:function|const|let|class)\s+([A-Za-z0-9_$]+)/gm)].map((m) => m[1]);
+}
+
+function splitAtPageBanner(src) {
+  const all = src.match(new RegExp(PAGE_BANNER.source, 'gm')) || [];
+  assert.equal(all.length, 1, 'index.js must carry exactly one "page side (registration)" banner');
+  const at = src.search(PAGE_BANNER);
+  return { worker: src.slice(0, at), page: src.slice(at) };
+}
+
+test('scope split: the scanner sees code, and only code (meta)', () => {
+  // A checker that reported nothing for everything would pass the real test
+  // below, so prove it flags a real use and ignores the look-alikes.
+  assert.deepEqual(pageGlobalsIn('const t = document.title;'), ['document']);
+  assert.deepEqual(pageGlobalsIn('x = `${window.innerWidth}px`;'), ['window']);
+  assert.deepEqual(pageGlobalsIn('scope.localStorage.getItem(k);'), ['localStorage']);
+  assert.deepEqual(pageGlobalsIn([
+    "matchAll({ type: 'window' });",
+    '// the document is not here',
+    '/* nor the window */',
+    'const s = "sessionStorage";',
+    'const t = `a document ${n} long`;',
+  ].join('\n')), []);
+});
+
+test('scope split: the worker half of index.js never names document/window/Web Storage', () => {
+  const { worker, page } = splitAtPageBanner(INDEX_SOURCE);
+
+  // The banner is where the split really is: the factory and the strategies
+  // sit above it, the registration and the pill below.
+  const workerExports = exportsDeclaredIn(worker);
+  const pageExports = exportsDeclaredIn(page);
+  for (const name of ['createServiceWorker', 'precache', 'pruneCaches', 'cacheFirst', 'networkFirst', 'staleWhileRevalidate', 'networkFirstWithTimeout']) {
+    assert.ok(workerExports.includes(name), `${name} is declared above the page banner`);
+  }
+  for (const name of ['registerServiceWorker', 'applyUpdateAndReload', 'showUpdatePrompt', 'registerWithUpdatePrompt']) {
+    assert.ok(pageExports.includes(name), `${name} is declared below the page banner`);
+  }
+
+  // The scanner must not have swallowed code: every worker-side export
+  // declaration survives the strip.
+  const workerCode = codeOnly(worker);
+  for (const name of workerExports) {
+    assert.match(workerCode, new RegExp(`\\bfunction\\s+${name}\\b|\\b(?:const|let|class)\\s+${name}\\b`), `${name} survives the comment/string strip`);
+  }
+
+  assert.deepEqual(pageGlobalsIn(worker), [], 'worker-side code references a page-only global');
+  // …and the page half genuinely reaches for them, so the split is not vacuous.
+  assert.ok(pageGlobalsIn(page).includes('document'), 'page-side code references document');
 });
