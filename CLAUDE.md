@@ -27,7 +27,15 @@ that must never be confused — the service-worker half (`createServiceWorker`
 and the strategies, which must never touch `document`/`window`) and the page
 half (`registerServiceWorker`, `showUpdatePrompt`, which must). It is one
 file, so both global sets are on and lint cannot tell them apart; that split
-is the suite's job, not the linter's.
+is the suite's job, not the linter's. The job is done by the two "scope
+split" cases at the bottom of `test.mjs`, which read `index.js` as text, split
+it at the `page side (registration)` banner, and fail on any `document`,
+`window`, `localStorage` or `sessionStorage` in the worker half's code. Until
+2026-09-22 this paragraph claimed the suite enforced the split when no test
+asserted it: the rest of the suite runs in bare Node against injected fakes,
+so a violation failed only if some case happened to execute that exact line.
+Keep the banner where the split really is — the test pins which exports sit
+on each side of it.
 
 <!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 

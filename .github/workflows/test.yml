@@ -20,6 +20,14 @@ jobs:
     uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@main
     with:
       verify-kit-pins: true
+      # `npm ci`, not family-ci's default `npm install`: the lockfile is
+      # committed, and the Monday bump installs with `npm ci`, so a lockfile
+      # out of step with package.json used to be a green PR and a red Monday.
+      install-command: npm ci
+      # @jfs/vendor-cli is a real `dependencies` entry (bin/vendor.mjs resolves
+      # it from inside this package) and pulls esbuild in behind it, so every
+      # consumer that installs this kit installs that tree. Audit it.
+      prod-audit: true
       maintenance-check: true
       run: |
         node --check index.js

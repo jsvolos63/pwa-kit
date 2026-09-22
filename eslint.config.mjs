@@ -11,7 +11,8 @@
 // scope and must never touch document/window) and the page half
 // (registerServiceWorker, showUpdatePrompt — which must). One file, so both
 // global sets are on; the split is enforced by the kit's own suite rather
-// than by lint.
+// than by lint — the "scope split" cases in test.mjs, which read index.js as
+// text and fail on a page-only global above the page-side banner.
 import js from '@eslint/js';
 import globals from 'globals';
 

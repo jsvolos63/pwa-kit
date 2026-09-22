@@ -1,8 +1,9 @@
 # @jfs/pwa-kit
 
 Shared, dependency-free **service-worker primitives** for the JFS family of
-buildless static PWAs (Weather, FlightCheck, Art-Gallery, market-monitor,
-JFS-Sports).
+buildless static PWAs. Eight apps vendor it: Weather, FlightCheck,
+BearsMockDraft, Surf-Tracker, John's News, Art-Gallery, market-monitor and
+JFS-Sports.
 
 Every one of those apps hand-rolls the same service worker — a version-keyed
 cache, an app-shell precache list, install/activate/old-cache eviction, and some
@@ -11,7 +12,11 @@ family's most common recurring bug (returning visitors stuck on a stale cached
 shell because the version wasn't bumped) lives in exactly that boilerplate. This
 package is the single, tested copy of it.
 
-## Two layers
+## Four layers
+
+The first two run in the **worker**, the last two on the **page**, and the
+worker half never touches `document`, `window` or Web Storage — `test.mjs`
+asserts that over the source, since one file carries both.
 
 **1. Composable primitives** — for apps with bespoke routing (Art-Gallery,
 market-monitor, JFS-Sports compose these in a slim `sw.js`):
@@ -26,8 +31,8 @@ market-monitor, JFS-Sports compose these in a slim `sw.js`):
   `cacheName`, `isCacheable`, `cacheKey`, `matchOptions`, `fallback`, `timeoutMs`.
 
 **2. `createServiceWorker(config)`** — a declarative one-call factory for the
-simple "one shell, one strategy" case (Weather, FlightCheck), built on the
-primitives above.
+simple "one shell, one strategy" case (Weather, FlightCheck, BearsMockDraft,
+Surf-Tracker, John's News), built on the primitives above.
 
 **3. `registerServiceWorker(options)`** — the **page-side** counterpart (runs
 in the page, not the worker). Every sibling app hand-rolls the same shape:
@@ -123,5 +128,13 @@ app's `npm run vendor:sync`), with `npm run vendor:check` failing CI on drift.
 ## Test
 
 ```
-node test.mjs   # or: npm test
+npm ci && npm test
 ```
+
+`npm test` runs three files. `test.mjs` is the kit's own suite and needs no
+install at all (`node test.mjs` runs it alone, air-gapped). `test-vendor.mjs`
+drives `bin/vendor.mjs` through the pinned `@jfs/vendor-cli` — the generator
+every consumer's `vendor:sync` actually runs — so it needs the install; without
+`node_modules` it fails with plain assertion errors, not an "install first".
+`test-repo.mjs` holds the cross-file rules between this repo's workflow files.
+CI also runs `node --check index.js` and `npm run lint`.
