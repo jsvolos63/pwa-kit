@@ -4,6 +4,8 @@
 # open for a review. The @jfs/* git pins are the weekly kit-pin bump's, not
 # Dependabot's. GitHub Actions monthly, so SHA-pinned third-party actions
 # pick up fixes.
+#
+# cooldown (family audit FAM-4): a version update is proposed only once the release is 7 days old; security updates are never delayed.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -11,6 +13,8 @@ updates:
     schedule:
       interval: weekly
       day: tuesday
+    cooldown:
+      default-days: 7
     groups:
       minor-and-patch:
         update-types: [minor, patch]
@@ -19,3 +23,5 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7

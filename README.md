@@ -34,6 +34,34 @@ market-monitor, JFS-Sports compose these in a slim `sw.js`):
 simple "one shell, one strategy" case (Weather, FlightCheck, BearsMockDraft,
 Surf-Tracker, John's News), built on the primitives above.
 
+**Pass `skipWaiting: false`.** The family's Service-worker-updates convention
+says a new build is never applied under a reader mid-session, and only a
+worker that *waits* meets it:
+
+```js
+// sw.js — the new worker waits for the pill's tap
+self.PWAKit.createServiceWorker({ cacheName: CACHE, shell: SHELL, skipWaiting: false, clientsClaim: false });
+```
+
+With `skipWaiting: false` the factory also wires the `SKIP_WAITING` message
+handler (`onSkipWaiting`), so the pill's tap has something to answer it; a
+`sw.js` that calls `onSkipWaiting(self)` itself as well is unharmed. The
+default is still `skipWaiting: true`, and `true` does **not** meet the
+convention: activating a new worker hands every page the registration already
+controls to it and fires `controllerchange` there — `clients.claim()` only
+concerns pages nothing controls yet (market-monitor measured the swap in
+Chromium, 2026-09-30: the open page's next lazy import came from the new
+build). It stays the default only so that no consumer's update model changes
+under the weekly pin bump. An app migrating must check its pill in the same
+change: a tap that just reloads (`onTap: () => location.reload()`) never
+activates a waiting worker, so its updates would strand — use the kit's
+default tap (below).
+
+The factory's `activate` skips its prune while a **newer** worker is
+installing or waiting (that worker's own `activate` prunes), so a tap that
+activates this build mid-install of the next one cannot delete the newer
+build's bucket.
+
 **3. `registerServiceWorker(options)`** — the **page-side** counterpart (runs
 in the page, not the worker). Every sibling app hand-rolls the same shape:
 register `sw.js`, watch `installing`, and when a worker reaches `installed`
@@ -80,16 +108,34 @@ registerWithUpdatePrompt({
 `registerWithUpdatePrompt` is `registerServiceWorker` preconfigured with the
 family defaults (`updateViaCache: 'none'`, `updateOnVisible`, register after
 `load`) plus the pill on a real upgrade; an app-supplied `onUpdate` still runs
-in addition (e.g. a diagnostics note). The pieces are exported separately —
-`showUpdatePrompt(options)` (idempotent pill; `label`/`id`/`style`/`onTap`;
-styles assigned via CSSOM so strict `style-src` CSPs need no allowance) and
-`applyUpdateAndReload(worker)` (the tap action). The tap is safe under BOTH
-family worker contracts: a worker already activated via install-time
-`skipWaiting` gets a plain reload, while a genuinely *waiting* worker (e.g. a
-`createServiceWorker({ skipWaiting: false })` + `onSkipWaiting` setup) is
-posted `SKIP_WAITING` and the reload rides `controllerchange`, with a timed
-fallback for workers that ignore the message. The `controllerchange` listener
-is bound only on tap, so the historic reload loop stays impossible.
+in addition (e.g. a diagnostics note). It threads the registration into the
+pill, so the tap applies whichever worker is waiting *when it is tapped*. The
+pieces are exported separately — `showUpdatePrompt(options)` (idempotent pill;
+`label`/`id`/`style`/`registration`/`ceilingMs`/`onTap`, where an `onTap`
+override receives `(worker, registration)`; styles assigned via CSSOM so
+strict `style-src` CSPs need no allowance) and
+`applyUpdateAndReload(worker, scope?, { registration, pill, ceilingMs }?)`
+(the tap action; the two-argument call still works). The tap, decided at tap
+time:
+
+- **Which worker:** `registration.waiting` — always the newest installed
+  build — else the worker the pill was created with. Without a registration in
+  hand it asks `navigator.serviceWorker.getRegistration()`. The pill is created
+  once and used to hold the *first* announced worker; after a second deploy
+  that worker is redundant and a `SKIP_WAITING` posted at it went nowhere.
+- **A waiting worker:** posted `SKIP_WAITING`; the reload rides
+  `controllerchange` (or the worker reaching `activated`), with two escapes so
+  the pill cannot strand — the worker turning `redundant`, and a ceiling,
+  `UPDATE_CEILING_MS` (20 s, `ceilingMs` to change it). It used to reload blind
+  after 800 ms, which landed on the OLD build whenever activation was slower
+  than that (an in-flight request holds the old worker). While it waits the
+  pill reads "Updating…" and is disabled, so a second tap arms nothing.
+- **An activated worker** (install-time `skipWaiting`), a redundant one with
+  nothing newer waiting, or none: a plain reload, as before.
+
+The `controllerchange` listener is bound only on tap, so the historic reload
+loop stays impossible — that, not the absence of `clients.claim()`, is what
+prevents it.
 
 ## How it's consumed
 
