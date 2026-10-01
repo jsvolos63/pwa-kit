@@ -29,6 +29,7 @@ import {
   showUpdatePrompt,
   applyUpdateAndReload,
   UPDATE_PROMPT_ID,
+  UPDATE_CEILING_MS,
 } from './index.js';
 
 // ───────────────────────── shared fakes ─────────────────────────
@@ -72,6 +73,9 @@ class FakeCaches {
 
 function makeScope({ origin = 'https://app.test', fetchImpl } = {}) {
   const base = new URL(origin + '/');
+  // Every listener per type, like a real EventTarget. This used to keep only
+  // the LAST one, so a sw.js adding its own `message` listener beside the
+  // factory's would have silently replaced it here and nowhere else.
   const listeners = {};
   const posted = [];
   const scope = {
@@ -80,18 +84,20 @@ function makeScope({ origin = 'https://app.test', fetchImpl } = {}) {
     fetch: fetchImpl,
     setTimeout: (fn, _ms) => { Promise.resolve().then(fn); return 0; }, // fire on next microtask
     skipWaitingCalled: false,
+    skipWaitingCalls: 0,
     claimCalled: false,
-    skipWaiting: async () => { scope.skipWaitingCalled = true; },
+    skipWaiting: async () => { scope.skipWaitingCalled = true; scope.skipWaitingCalls += 1; },
     clients: {
       claim: async () => { scope.claimCalled = true; },
       matchAll: async () => [{ postMessage: (m) => posted.push(m) }],
     },
-    addEventListener: (type, fn) => { listeners[type] = fn; },
-    _emit: (type, event) => listeners[type] && listeners[type](event),
+    addEventListener: (type, fn) => { (listeners[type] ||= []).push(fn); },
+    _listeners: listeners,
+    _emit: (type, event) => (listeners[type] || []).forEach((fn) => fn(event)),
     _dispatch: async (type, event) => {
       const waits = [];
       const ev = { ...event, waitUntil: (p) => waits.push(p), respondWith: (p) => { ev._response = p; } };
-      listeners[type](ev);
+      (listeners[type] || []).forEach((fn) => fn(ev));
       if (type === 'fetch') { if (ev._response) ev._responseResolved = await ev._response; return ev; }
       await Promise.all(waits);
       return ev;
@@ -631,6 +637,96 @@ test('createServiceWorker: clientsClaim:true is still honored when asked for exp
   assert.equal(scope.claimCalled, true);
 });
 
+// ─────────── the update model: skipWaiting, SKIP_WAITING, the prune guard ───────────
+//
+// Install-time skipWaiting does NOT keep the open page on its worker:
+// activation hands every page the registration controls to the new worker
+// (the SW spec's Activate step; measured in Chromium by market-monitor,
+// 2026-09-30). The waiting worker is the compliant model. The DEFAULT stays
+// `true` anyway, because flipping it under eight apps' unreviewed weekly pin
+// bump would strand every app whose pill just reloads.
+
+test('createServiceWorker: skipWaiting stays ON by default — no consumer is switched silently', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'] });
+  await scope._dispatch('install', {});
+  assert.equal(scope.skipWaitingCalls, 1, 'install still activates at once under the default');
+  // …and the default gains nothing it did not have: no message listener, so
+  // a consumer on the default behaves exactly as it did before 0.8.0.
+  assert.equal(scope._listeners.message, undefined, 'no SKIP_WAITING handler under the default');
+});
+
+test('createServiceWorker({ skipWaiting: false }): install waits; the pill\'s SKIP_WAITING activates it', async () => {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'], skipWaiting: false });
+  await scope._dispatch('install', {});
+  assert.equal(scope.skipWaitingCalls, 0, 'a waiting worker must not skip waiting on its own');
+  // Unrelated messages are not a tap.
+  scope._emit('message', { data: { type: 'SOMETHING_ELSE' } });
+  scope._emit('message', { data: null });
+  assert.equal(scope.skipWaitingCalls, 0);
+  // The page's tap posts { type: 'SKIP_WAITING' } — something must answer it,
+  // or the update strands until every window closes.
+  scope._emit('message', { data: { type: 'SKIP_WAITING' } });
+  assert.equal(scope.skipWaitingCalls, 1, 'SKIP_WAITING is answered with no extra line in sw.js');
+});
+
+test('createServiceWorker({ skipWaiting: false }) beside a sw.js that also calls onSkipWaiting: still activates', async () => {
+  // A consumer that wired the handler by hand before 0.8.0 keeps it. Two
+  // listeners each call skipWaiting() on one tap; that is idempotent in the
+  // browser (the second Try Activate returns at once), and nothing here throws
+  // or swallows the other listener.
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  createServiceWorker({ scope, cacheName: 'w-1', shell: ['/'], skipWaiting: false });
+  onSkipWaiting(scope);
+  await scope._dispatch('install', {});
+  assert.equal(scope.skipWaitingCalls, 0);
+  assert.equal(scope._listeners.message.length, 2, 'the factory\'s listener and the consumer\'s');
+  assert.doesNotThrow(() => scope._emit('message', { data: { type: 'SKIP_WAITING' } }));
+  assert.equal(scope.skipWaitingCalled, true, 'the tap still activates the waiting worker');
+  assert.equal(scope.skipWaitingCalls, 2, 'both listeners answered — the duplicate call is the harmless kind');
+});
+
+// The activate prune keeps only this build's bucket. Run while a NEWER worker
+// is installing or waiting (a tap activated this one mid-install of the next
+// deploy), it deletes that worker's bucket and the newest build activates
+// with an empty shell — measured in market-monitor's e2e harness.
+async function activateWith(registration, extra = {}) {
+  const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
+  if (registration !== undefined) scope.registration = registration;
+  createServiceWorker({ scope, cacheName: 'myapp-2', shell: ['/'], ...extra });
+  await scope.caches.open('myapp-1'); // an older build's bucket
+  await scope.caches.open('myapp-2'); // this build's
+  await scope.caches.open('myapp-3'); // the NEXT build's, mid-install
+  await scope._dispatch('activate', {});
+  return { scope, keys: (await scope.caches.keys()).sort() };
+}
+
+test('createServiceWorker: activate skips the prune while a newer worker is INSTALLING', async () => {
+  const { scope, keys } = await activateWith({ installing: { state: 'installing' }, waiting: null }, {
+    clientsClaim: true, notifyOnActivate: { type: 'SW_UPDATED' },
+  });
+  assert.deepEqual(keys, ['myapp-1', 'myapp-2', 'myapp-3'], 'the installing build keeps its bucket');
+  // Only the prune is deferred — the rest of activate still runs.
+  assert.equal(scope.claimCalled, true);
+  assert.deepEqual(scope._posted, [{ type: 'SW_UPDATED' }]);
+});
+
+test('createServiceWorker: activate skips the prune while a newer worker is WAITING', async () => {
+  const { keys } = await activateWith({ installing: null, waiting: { state: 'installed' } });
+  assert.deepEqual(keys, ['myapp-1', 'myapp-2', 'myapp-3']);
+});
+
+test('createServiceWorker: activate prunes when no newer worker exists — and without a registration at all', async () => {
+  const none = await activateWith({ installing: null, waiting: null, active: { state: 'activating' } });
+  assert.deepEqual(none.keys, ['myapp-2'], 'nothing newer: the normal prune');
+  // Hand-built test scopes (this suite's, FlightCheck's) carry no
+  // `registration`; the guard must not turn that into a crash or a skip.
+  const bare = await activateWith(undefined);
+  assert.equal(bare.scope.registration, undefined);
+  assert.deepEqual(bare.keys, ['myapp-2']);
+});
+
 test('createServiceWorker: default activate prunes only its own prefix, spares a sibling app', async () => {
   const scope = makeScope({ fetchImpl: async () => makeResponse('net') });
   createServiceWorker({ scope, cacheName: 'myapp-2', shell: ['/'] });
@@ -1118,9 +1214,13 @@ function makeFakeDoc(win) {
   return doc;
 }
 
-function makeFakeWin() {
+// A window whose timers run on a fake clock: `_advance(ms)` fires what is due,
+// `_runTimeouts()` fires everything regardless of delay. `getRegistration`,
+// when given, is installed on navigator.serviceWorker.
+function makeFakeWin({ getRegistration } = {}) {
   const swListeners = {};
   const timeouts = [];
+  let now = 0;
   const win = {
     reloads: 0,
     location: { reload() { win.reloads += 1; } },
@@ -1132,16 +1232,35 @@ function makeFakeWin() {
           swListeners.controllerchange = list.filter((l) => !l.once);
           list.forEach((l) => l.cb());
         },
+        _listenerCount(type) { return (swListeners[type] || []).length; },
       },
     },
-    setTimeout(fn, ms) { timeouts.push([fn, ms]); return timeouts.length; },
-    _runTimeouts() { const t = timeouts.splice(0); t.forEach(([fn]) => fn()); },
+    setTimeout(fn, ms) { timeouts.push({ fn, ms, at: now + (ms || 0) }); return timeouts.length; },
+    _timeouts: timeouts,
+    _runTimeouts() { const t = timeouts.splice(0); t.forEach(({ fn }) => fn()); },
+    _advance(ms) {
+      now += ms;
+      for (const t of timeouts.filter((x) => x.at <= now)) {
+        timeouts.splice(timeouts.indexOf(t), 1);
+        t.fn();
+      }
+    },
   };
+  if (getRegistration) win.navigator.serviceWorker.getRegistration = getRegistration;
   return win;
 }
 
+// A ServiceWorker stand-in: records what is posted to it and fires
+// `statechange` on become(state), as a real worker does on the page.
 function makePromptWorker(state = 'installed') {
-  return { state, messages: [], postMessage(m) { this.messages.push(m); } };
+  const listeners = [];
+  return {
+    state,
+    messages: [],
+    postMessage(m) { this.messages.push(m); },
+    addEventListener(type, cb) { if (type === 'statechange') listeners.push(cb); },
+    become(s) { this.state = s; listeners.forEach((cb) => cb()); },
+  };
 }
 
 test('showUpdatePrompt: builds the pill once, idempotent by id', () => {
@@ -1246,6 +1365,180 @@ test('registerWithUpdatePrompt: family defaults + pill on a real upgrade', async
   assert.equal(alsoRan, 1); // app onUpdate runs in addition to the pill
   // updateViaCache 'none' default reached register()
   assert.deepEqual(scope.calls.register[0][1], { updateViaCache: 'none' });
+});
+
+// ───────────────── the tap, decided at TAP time (0.8.0) ─────────────────
+//
+// The pill is created once per document and used to hold the worker from the
+// FIRST announce, then reload blind after 800 ms. Both misfired in
+// market-monitor (Chromium): a second deploy left the held worker redundant
+// (its SKIP_WAITING went nowhere and the fallback reloaded the OLD shell), and
+// any request slower than 800 ms held the old worker so the blind reload
+// landed on the OLD build before the new one activated.
+
+test('tap resolves the worker at TAP time: a pill holding a superseded worker activates registration.waiting', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const first = makePromptWorker('installed');
+  const registration = { waiting: first };
+  const pill = showUpdatePrompt({ doc, worker: first, registration });
+  // A second deploy installs before the tap: it takes the waiting slot and
+  // the worker the pill was created with goes redundant.
+  const second = makePromptWorker('installed');
+  first.state = 'redundant';
+  registration.waiting = second;
+  pill.click();
+  assert.deepEqual(first.messages, [], 'nothing is posted at the superseded worker');
+  assert.deepEqual(second.messages, [{ type: 'SKIP_WAITING' }]);
+  assert.equal(win.reloads, 0, 'no reload until the new worker controls the page');
+  win.navigator.serviceWorker._fireControllerChange();
+  assert.equal(win.reloads, 1);
+});
+
+test('registerWithUpdatePrompt threads the registration into the pill, so the newest deploy is the one applied', async () => {
+  const first = makeWorker();
+  const scope = makePageScope({ controller: {}, installing: first, readyState: 'complete' });
+  makeFakeDoc(scope);
+  scope.document.readyState = 'complete';
+  scope.document.addEventListener = () => {};
+  // The tap's half of the window, on the same scope.
+  scope.reloads = 0;
+  scope.location = { reload() { scope.reloads += 1; } };
+  const changes = [];
+  scope.navigator.serviceWorker.addEventListener = (type, cb) => { if (type === 'controllerchange') changes.push(cb); };
+  scope.setTimeout = () => 0;
+  registerWithUpdatePrompt({ scope });
+  await flush();
+  first.setState('installed');
+  const pill = scope.document.getElementById(UPDATE_PROMPT_ID);
+  assert.ok(pill, 'pill shown for the first deploy');
+  // The second deploy lands before the tap.
+  const second = makePromptWorker('installed');
+  first.state = 'redundant';
+  scope.registration.waiting = second;
+  pill.click();
+  assert.deepEqual(second.messages, [{ type: 'SKIP_WAITING' }], 'the registration\'s waiting worker, not the held one');
+  assert.equal(scope.reloads, 0);
+  changes.forEach((cb) => cb());
+  assert.equal(scope.reloads, 1);
+});
+
+test('tap: a redundant worker with nothing newer waiting reloads at once — no wait for the ceiling', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const stale = makePromptWorker('redundant');
+  showUpdatePrompt({ doc, worker: stale, registration: { waiting: null } }).click();
+  assert.equal(win.reloads, 1);
+  assert.deepEqual(stale.messages, []);
+  assert.equal(win._timeouts.length, 0, 'no ceiling armed');
+});
+
+test('tap: no blind reload at 800 ms — a waiting worker gets until the UPDATE_CEILING_MS ceiling', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  showUpdatePrompt({ doc, worker: makePromptWorker('installed') }).click();
+  assert.equal(UPDATE_CEILING_MS, 20000);
+  assert.deepEqual(win._timeouts.map((t) => t.ms), [UPDATE_CEILING_MS]);
+  win._advance(800);
+  assert.equal(win.reloads, 0, 'the old 800 ms fallback reloaded onto the OLD build here');
+  win._advance(UPDATE_CEILING_MS - 801);
+  assert.equal(win.reloads, 0);
+  win._advance(1);
+  assert.equal(win.reloads, 1, 'the ceiling reloads a worker that never took over');
+});
+
+test('tap: the ceiling is configurable (showUpdatePrompt / prompt `ceilingMs`)', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  showUpdatePrompt({ doc, worker: makePromptWorker('installed'), ceilingMs: 5000 }).click();
+  assert.deepEqual(win._timeouts.map((t) => t.ms), [5000]);
+  win._advance(4999);
+  assert.equal(win.reloads, 0);
+  win._advance(1);
+  assert.equal(win.reloads, 1);
+});
+
+test('tap: reloads when the waiting worker turns redundant (superseded, or failed to activate)', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const worker = makePromptWorker('installed');
+  showUpdatePrompt({ doc, worker }).click();
+  win._advance(1000);
+  assert.equal(win.reloads, 0);
+  worker.become('redundant');
+  assert.equal(win.reloads, 1);
+  win._runTimeouts();
+  win.navigator.serviceWorker._fireControllerChange();
+  assert.equal(win.reloads, 1, 'still exactly one reload');
+});
+
+test('tap: reaching `activated` reloads too — a worker still activating at the tap is waited for, not reloaded under', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const worker = makePromptWorker('activating');
+  showUpdatePrompt({ doc, worker }).click();
+  assert.equal(win.reloads, 0, 'its controllerchange may have fired already — wait for the activation');
+  worker.become('activated');
+  assert.equal(win.reloads, 1);
+});
+
+test('tap: the pill says "Updating…" and is disabled while it waits; a second tap arms nothing', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const worker = makePromptWorker('installed');
+  const pill = showUpdatePrompt({ doc, worker });
+  pill.click();
+  assert.equal(pill.textContent, 'Updating…');
+  assert.equal(pill.disabled, true);
+  pill.click(); // a stand-in element ignores `disabled`; the handler must not
+  assert.deepEqual(worker.messages, [{ type: 'SKIP_WAITING' }], 'one SKIP_WAITING, not two');
+  assert.equal(win.navigator.serviceWorker._listenerCount('controllerchange'), 1, 'one listener set');
+  assert.equal(win._timeouts.length, 1, 'one ceiling');
+});
+
+test('tap: an activated worker reloads at once and leaves the pill as it was', () => {
+  const win = makeFakeWin();
+  const doc = makeFakeDoc(win);
+  const pill = showUpdatePrompt({ doc, worker: makePromptWorker('activated'), registration: { waiting: null } });
+  pill.click();
+  assert.equal(win.reloads, 1);
+  assert.match(pill.textContent, /New version available/);
+  assert.equal(pill.disabled, undefined);
+});
+
+test('applyUpdateAndReload: with no registration in hand, asks getRegistration() at tap time', async () => {
+  const fresh = makePromptWorker('installed');
+  const win = makeFakeWin({ getRegistration: async () => ({ waiting: fresh }) });
+  const held = makePromptWorker('redundant');
+  applyUpdateAndReload(held, win);
+  await microtasks();
+  assert.deepEqual(held.messages, []);
+  assert.deepEqual(fresh.messages, [{ type: 'SKIP_WAITING' }]);
+  assert.equal(win.reloads, 0);
+  win.navigator.serviceWorker._fireControllerChange();
+  assert.equal(win.reloads, 1);
+});
+
+test('applyUpdateAndReload: a failed or empty getRegistration() falls back to the held worker', async () => {
+  const win = makeFakeWin({ getRegistration: async () => { throw new Error('gone'); } });
+  const held = makePromptWorker('installed');
+  applyUpdateAndReload(held, win);
+  await microtasks();
+  assert.deepEqual(held.messages, [{ type: 'SKIP_WAITING' }], 'the lookup failed — the held worker is applied');
+
+  const win2 = makeFakeWin({ getRegistration: async () => ({ waiting: null }) });
+  applyUpdateAndReload(makePromptWorker('activated'), win2);
+  await microtasks();
+  assert.equal(win2.reloads, 1, 'nothing waiting, held worker already active: a plain reload');
+});
+
+test('showUpdatePrompt: an onTap override also receives the registration', () => {
+  const doc = makeFakeDoc(makeFakeWin());
+  const worker = makePromptWorker('installed');
+  const registration = { waiting: worker };
+  const taps = [];
+  showUpdatePrompt({ doc, worker, registration, onTap: (w, r) => taps.push([w, r]) }).click();
+  assert.deepEqual(taps, [[worker, registration]]);
 });
 
 // ───────────────── the worker / page scope split ─────────────────
