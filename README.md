@@ -52,7 +52,7 @@ controls to it and fires `controllerchange` there — `clients.claim()` only
 concerns pages nothing controls yet (market-monitor measured the swap in
 Chromium, 2026-09-30: the open page's next lazy import came from the new
 build). It stays the default only so that no consumer's update model changes
-under the weekly pin bump. An app migrating must check its pill in the same
+under the monthly pin bump. An app migrating must check its pill in the same
 change: a tap that just reloads (`onTap: () => location.reload()`) never
 activates a waiting worker, so its updates would strand — use the kit's
 default tap (below).

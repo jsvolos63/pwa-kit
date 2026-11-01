@@ -1,8 +1,9 @@
 # Family dependency policy (see the Dependencies convention in CLAUDE.md):
-# weekly npm with minor and patch grouped into one PR that the Dependabot
-# merge workflow lands once CI is green; majors arrive on their own and stay
-# open for a review. The @jfs/* git pins are the weekly kit-pin bump's, not
-# Dependabot's. GitHub Actions monthly, so SHA-pinned third-party actions
+# monthly npm (the owner's decision of 2026-11-01) with minor and patch
+# grouped into one PR that the Dependabot merge workflow lands once CI is
+# green; majors arrive on their own and stay open for a review. The @jfs/*
+# git pins are the monthly kit-pin bump's, not Dependabot's. GitHub Actions
+# monthly, so SHA-pinned third-party actions
 # pick up fixes.
 #
 # cooldown (family audit FAM-4): a version update is proposed only once the release is 7 days old; security updates are never delayed.
@@ -11,8 +12,7 @@ updates:
   - package-ecosystem: npm
     directory: /
     schedule:
-      interval: weekly
-      day: tuesday
+      interval: monthly
     cooldown:
       default-days: 7
     groups:
