@@ -268,29 +268,30 @@ held. One row anyway, because it is a floor decision rather than a bump:
 
 Three items that are not dependencies:
 
-- **Every app still has to move to the waiting worker.** The family's
+- **Every app is on the waiting worker (since 2026-11-06).** The family's
   Service-worker-updates convention names one compliant mechanism since
   vendor-cli #64 (2026-10-01): a worker that waits, and a pill that resolves
   `registration.waiting` at tap time, posts it `SKIP_WAITING` and reloads on
   `controllerchange`. 0.8.0 makes that work out of the box —
-  `createServiceWorker({ skipWaiting: false })` wires the handler, the kit's
-  default tap does the rest — but the kit default stays `skipWaiting: true`
-  (see "load-bearing" below), so nothing changes in an app until that app
-  changes. Open, one app at a time (re-measured 2026-11-06 against each
-  app's `sw.js` on main): **Surf-Tracker, John's News and Weather** run the
-  factory default; **Art-Gallery-** hand-rolls an install-time-skipWaiting
-  worker. Each migration passes `skipWaiting: false` (or drops its
-  install-time `skipWaiting()`) and checks its pill in the same change —
-  Weather's `onTap: () => location.reload()` would strand a waiting worker, so
-  it moves to the kit's default tap. Already on the waiting model with a
-  tap-time pill of their own: market-monitor (its PR #449) and JFS-Sports
-  (whose fallback reload is still a blind 3 s); either can now drop its
-  hand-rolled tap for the kit's. Moved since this list was first written,
-  each in its robustness pass: **BearsMockDraft** (2.35.0, #209, 2026-10-07;
-  composes the kit's primitives, no install handler, `onSkipWaiting`),
-  **Zepbound-** (1.12.0, 2026-10-07; no `skipWaiting()` in install, answers
-  `SKIP_WAITING`) and **FlightCheck** (1.9.3, #239, 2026-10-08;
-  `createServiceWorker({ skipWaiting: false })`).
+  `createServiceWorker({ skipWaiting: false })` wires the handler and the
+  kit's default tap does the rest. Where each app stands, measured against
+  its `sw.js` on main:
+  - **Factory consumers, all passing `skipWaiting: false`:** FlightCheck
+    (1.9.3, #239, 2026-10-08), John's News (0.9.39, #141), Surf-Tracker
+    (1.59.3, #316) and Weather (1.36.5, #180; its reload-only `onTap` went in
+    the same change, for the kit's default tap). The last three landed on
+    2026-11-06, each verified in headless Chromium: the new worker waits with
+    no reload or `controllerchange`, the pill shows, and the tap reloads onto
+    it.
+  - **Composed from the kit's primitives:** BearsMockDraft (2.35.0, #209,
+    2026-10-07; no install handler, `onSkipWaiting`), market-monitor (its PR
+    #449) and JFS-Sports, the last two with a tap-time pill of their own
+    (JFS-Sports' fallback reload is still a blind 3 s); either can drop its
+    hand-rolled tap for the kit's.
+  - **Hand-rolled workers:** Zepbound- (1.12.0, 2026-10-07; no
+    `skipWaiting()` in install, answers `SKIP_WAITING`) and Art-Gallery-
+    (1.32.27, #442, 2026-11-06; `onSkipWaiting`, a held prune, and a toast
+    whose tap is the kit's `applyUpdateAndReload`).
 - **FAM-1(d), from the 2026-09-26 family security audit: "auto-merge: false
   for the two browser-shipped kits (news-kit, pwa-kit) in the eight apps."**
   **Closed by owner decision, 2026-11-01: not taken — auto-merge stays on
@@ -333,13 +334,14 @@ Three items that are not dependencies:
 - **`skipWaiting` defaults to TRUE, although `true` does not meet the family
   convention.** It reads like the bug v0.7.0 fixed for `clientsClaim`, and
   flipping it looks like the obvious completion of that fix. It is not the
-  same: of the four factory consumers, only FlightCheck passes `skipWaiting`
-  (`false`, since 2026-10-08); Surf-Tracker, John's News and Weather ride the
-  default, and a consumer whose pill just reloads (Weather's own `onTap`)
+  same: a consumer that rode the default with a pill that just reloads
   would, behind a worker that suddenly waits, never activate a new build —
-  through a pin bump that merges unreviewed in every app. The default can
-  flip once every factory consumer passes the option itself (it is then dead
-  either way), or as part of a decision on FAM-1(d). Pinned by the
+  through a pin bump that merges unreviewed in every app. The condition this
+  note set for flipping it, every factory consumer passing the option
+  itself, has held since 2026-11-06 (all four pass `false`), so the default is
+  now dead for every consumer and can flip in a release of its own. It has
+  not been flipped: that is a kit change for a session to make deliberately,
+  with `test.mjs`'s case and `index.js`'s reasoning moved together. Pinned by the
   "skipWaiting stays ON by default" case in `test.mjs`; `index.js` carries the
   full reasoning beside the option.
 - **The factory's `activate` skips its prune while `registration.installing`
@@ -436,6 +438,7 @@ a browser or the GitHub API tools.
 
 | Date | Cadence | Outcome |
 | --- | --- | --- |
+| 2026-11-06 | Family audit follow-up | **The last four apps moved to the waiting worker.** John's News #141 (0.9.39), Surf-Tracker #316 (1.59.3) and Weather #180 (1.36.5) pass `createServiceWorker({ skipWaiting: false })` (Weather's reload-only `onTap` replaced by the kit's default tap in the same change); Art-Gallery- #442 (1.32.27) drops its install-time `skipWaiting()`, answers `SKIP_WAITING`, holds its prune, and its toast taps `applyUpdateAndReload`. Each verified in headless Chromium. Every factory consumer now passes the option, so the default-flip condition in "load-bearing" holds; the default itself is unchanged. |
 | 2026-11-06 | Family audit | **The waiting-worker list corrected; no code change.** Re-measured against every app's `sw.js` on main: BearsMockDraft (2.35.0, 2026-10-07), Zepbound- (1.12.0, 2026-10-07) and FlightCheck (1.9.3, 2026-10-08) had moved to the waiting worker in their robustness passes, and the open item above still listed all three. Still open: Surf-Tracker, John's News and Weather on the factory default, Art-Gallery- with an install-time `skipWaiting()`. The load-bearing note on the default now counts four factory consumers, one of which (FlightCheck) passes the option. |
 | 2026-11-01 | Owner decisions | **Routine updates monthly** (the owner's family-wide decision of 2026-11-01): `dependabot.yml` npm weekly Tuesday → `interval: monthly` (cooldown 7 days kept; security updates unaffected); `kit-pin-bump.yml` from Mondays to `41 6 2 * *`, the 2nd of each month at the same hour; this file, CLAUDE.md, README and the `test-repo.mjs` test name follow. Family blocks re-synced from vendor-cli 0.22.1. **FAM-1(d) closed by owner decision**: auto-merge stays on for the pwa-kit and news-kit bumps. The owner deleted the stale `claude/*` / `copilot/*` branches today, so the leftover-branch note is closed. No version bump: nothing under `version-guard-paths` (`index.js bin`) changed. |
 | 2026-10-26 | Family security review (advisories) | `npm audit`: one high, dev-only. `brace-expansion` 5.0.9 (GHSA-q2hr-2g5m-vwhr, GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p — CPU and stack-exhaustion DoS), reached through `minimatch` in the lint toolchain, moved in range to 5.0.12 (published 2026-09-14). Nothing ships: the lockfile is not part of the vendored surface (`index.js`, `bin`), so no version bump. `npm audit` 0; `npm run lint` and `npm test` green. |
@@ -519,7 +522,7 @@ evidence that the deploy works.
 
 ### Who watches the watchers
 
-The automation above is what makes fourteen repos maintainable with the owner
+The automation above is what makes fifteen repos maintainable with the owner
 away, which makes a silent failure *in the automation* the highest-severity
 failure mode in the family — and until this protocol existed, nothing watched
 it at all.
