@@ -276,16 +276,21 @@ Three items that are not dependencies:
   `createServiceWorker({ skipWaiting: false })` wires the handler, the kit's
   default tap does the rest — but the kit default stays `skipWaiting: true`
   (see "load-bearing" below), so nothing changes in an app until that app
-  changes. Open, one app at a time: **Surf-Tracker, BearsMockDraft,
-  FlightCheck, John's News and Weather** run the factory default;
-  **Art-Gallery-** and **Zepbound-** hand-roll an install-time-skipWaiting
+  changes. Open, one app at a time (re-measured 2026-11-06 against each
+  app's `sw.js` on main): **Surf-Tracker, John's News and Weather** run the
+  factory default; **Art-Gallery-** hand-rolls an install-time-skipWaiting
   worker. Each migration passes `skipWaiting: false` (or drops its
   install-time `skipWaiting()`) and checks its pill in the same change —
   Weather's `onTap: () => location.reload()` would strand a waiting worker, so
   it moves to the kit's default tap. Already on the waiting model with a
   tap-time pill of their own: market-monitor (its PR #449) and JFS-Sports
   (whose fallback reload is still a blind 3 s); either can now drop its
-  hand-rolled tap for the kit's.
+  hand-rolled tap for the kit's. Moved since this list was first written,
+  each in its robustness pass: **BearsMockDraft** (2.35.0, #209, 2026-10-07;
+  composes the kit's primitives, no install handler, `onSkipWaiting`),
+  **Zepbound-** (1.12.0, 2026-10-07; no `skipWaiting()` in install, answers
+  `SKIP_WAITING`) and **FlightCheck** (1.9.3, #239, 2026-10-08;
+  `createServiceWorker({ skipWaiting: false })`).
 - **FAM-1(d), from the 2026-09-26 family security audit: "auto-merge: false
   for the two browser-shipped kits (news-kit, pwa-kit) in the eight apps."**
   **Closed by owner decision, 2026-11-01: not taken — auto-merge stays on
@@ -328,7 +333,8 @@ Three items that are not dependencies:
 - **`skipWaiting` defaults to TRUE, although `true` does not meet the family
   convention.** It reads like the bug v0.7.0 fixed for `clientsClaim`, and
   flipping it looks like the obvious completion of that fix. It is not the
-  same: no factory consumer passes `skipWaiting`, so all five ride the
+  same: of the four factory consumers, only FlightCheck passes `skipWaiting`
+  (`false`, since 2026-10-08); Surf-Tracker, John's News and Weather ride the
   default, and a consumer whose pill just reloads (Weather's own `onTap`)
   would, behind a worker that suddenly waits, never activate a new build —
   through a pin bump that merges unreviewed in every app. The default can
@@ -430,6 +436,7 @@ a browser or the GitHub API tools.
 
 | Date | Cadence | Outcome |
 | --- | --- | --- |
+| 2026-11-06 | Family audit | **The waiting-worker list corrected; no code change.** Re-measured against every app's `sw.js` on main: BearsMockDraft (2.35.0, 2026-10-07), Zepbound- (1.12.0, 2026-10-07) and FlightCheck (1.9.3, 2026-10-08) had moved to the waiting worker in their robustness passes, and the open item above still listed all three. Still open: Surf-Tracker, John's News and Weather on the factory default, Art-Gallery- with an install-time `skipWaiting()`. The load-bearing note on the default now counts four factory consumers, one of which (FlightCheck) passes the option. |
 | 2026-11-01 | Owner decisions | **Routine updates monthly** (the owner's family-wide decision of 2026-11-01): `dependabot.yml` npm weekly Tuesday → `interval: monthly` (cooldown 7 days kept; security updates unaffected); `kit-pin-bump.yml` from Mondays to `41 6 2 * *`, the 2nd of each month at the same hour; this file, CLAUDE.md, README and the `test-repo.mjs` test name follow. Family blocks re-synced from vendor-cli 0.22.1. **FAM-1(d) closed by owner decision**: auto-merge stays on for the pwa-kit and news-kit bumps. The owner deleted the stale `claude/*` / `copilot/*` branches today, so the leftover-branch note is closed. No version bump: nothing under `version-guard-paths` (`index.js bin`) changed. |
 | 2026-10-26 | Family security review (advisories) | `npm audit`: one high, dev-only. `brace-expansion` 5.0.9 (GHSA-q2hr-2g5m-vwhr, GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p — CPU and stack-exhaustion DoS), reached through `minimatch` in the lint toolchain, moved in range to 5.0.12 (published 2026-09-14). Nothing ships: the lockfile is not part of the vendored surface (`index.js`, `bin`), so no version bump. `npm audit` 0; `npm run lint` and `npm test` green. |
 | 2026-10-01 | Kit change (0.8.0) + weekly questions | **The update model, corrected.** The family's Service-worker-updates convention named two mechanisms, and the second — a worker that activates on install but never claims — is not swap-free: the SW spec's Activate step hands every page the registration already controls to the new worker (`claim()` only concerns uncontrolled pages), measured by market-monitor in Chromium on 2026-09-30 (its PR #449). vendor-cli #64 (`692b387`, 0.22.0) now names one mechanism, the waiting worker; this PR is the kit half. **0.7.0 → 0.8.0, additive:** (1) `index.js`'s false comments corrected — the `skipWaiting` default's "never seizes the open page", registerServiceWorker's "the OLD worker keeps controlling this page", the page-side claim that not claiming makes the refresh loop impossible (only the absence of any reload-on-`controllerchange` but the tap's does), and the pill section's contract; each now says `skipWaiting: true` does not meet the convention and stays the default only so no consumer is switched silently. (2) `createServiceWorker({ skipWaiting: false })` wires `onSkipWaiting` itself; a sw.js that also calls it is unharmed. (3) The factory's `activate` skips the prune while a newer worker is installing or waiting. (4) The pill's tap resolves `registration.waiting` at tap time (threaded from `registerWithUpdatePrompt`, else `getRegistration()`), reloads on `controllerchange`, on the worker turning redundant or reaching `activated`, or at `UPDATE_CEILING_MS` (20 s, `ceilingMs`) instead of blind at 800 ms, and shows "Updating…" with the pill disabled. **Not changed: the `skipWaiting` default** (see "load-bearing"). Consumers checked first: all five factory callers ride the default and none calls `onSkipWaiting`; JFS-Sports and market-monitor call it from composed workers; `skipWaiting: false` appeared nowhere but README; no consumer suite drives the tap or the prune. **Tests 102 → 121** (`test.mjs` 91 → 109, `test-vendor.mjs` 9 → 10); 14 of the 18 new kit cases fail on 0.7.0's `index.js`, the other 4 pin what must not change, and 19 targeted mutations of the new code each turn a case red. **Also:** `test-vendor.mjs` is now fetch-kit's copy (stderr-matched refusals, an `--format esm --pick` case; the two cases that passed on a missing CLI now fail); `.github/dependabot.yml` gains a 7-day `cooldown` on both ecosystems (family audit FAM-4); both synced blocks re-synced from vendor-cli `692b387` by `jfs-claude-md-sync` / `jfs-maintenance-sync`, untouched by hand; CLAUDE.md gains "The update model"; README documents `skipWaiting: false` and the tap; this file corrected where it had gone stale — the bump has worked since the Actions setting was turned on (#44, #45, bot-opened and bot-merged), the monitor has its token, the version guard runs on dispatch, create-pull-request is v8.1.1, consumer pins re-measured, and every bot PR's held "Action required" `Test` run explained as not the validation. **Weekly questions:** (1) `kit-pin-bump.yml` last run #11 (2026-09-28) green, and the 2026-10-01 monitor report shows it ✓; (2) no `auto/*` branch; (3) the one pin is vendor-cli `bef0be8` (0.21.10) against main's `692b387`, merged today — inside the weekly cadence, Monday's bump takes it; (4) no open bot PRs. **Left open:** each app's move to the waiting worker (Surf-Tracker, BearsMockDraft, FlightCheck, John's News, Weather on the kit default; Art-Gallery- and Zepbound- hand-rolled); FAM-1(d); the `engines.node` change now owed across the four kits (vendor-cli is `>=22`); invariant 5 still prose; the `v0.8.0` tag, which `release.yml` cuts after this merge's push-to-main `Test` run; the leftover `claude/family-review-3urdej` branch (left alone). |
